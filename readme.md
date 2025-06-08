@@ -28,51 +28,53 @@ It works proactively, anticipating what context an agent needs and retrieving it
 ```mermaid
 flowchart TD
     subgraph Inputs
-        USER[User Input<br/>(Chat, Commands)]
-        ENV[Environment Input<br/>(System Logs, APIs)]
+        USER["User Input<br/>(Chat, Commands)"]
+        ENV["Environment Input<br/>(System Logs, APIs)"]
     end
 
-    subgraph CoreLogic [Orchestration & Reasoning Layer]
-        CA[Context Agent<br/>(Proactive Orchestrator)]
-        Retriever[LLM-1: Retriever<br/>(Searches & Reads Memory)]
-        Listener[LLM-2: Listener<br/>(Summarizes, Saves & Updates Memory)]
+    subgraph CoreLogic ["Orchestration & Reasoning Layer"]
+        CA["Context Agent<br/>(Proactive Orchestrator)"]
+        Retriever["LLM-1: Retriever<br/>(Searches & Reads Memory)"]
+        Listener["LLM-2: Listener<br/>(Summarizes, Saves & Updates Memory)"]
     end
 
-    subgraph MemorySystem [Unified Memory System]
-        GraphDB[Graph DB<br/>(Central Index: Keywords, Links, Embeddings)]
+    subgraph MemorySystem ["Unified Memory System"]
+        GraphDB["Graph DB<br/>(Central Index: Keywords, Links, Embeddings)"]
 
-        subgraph STM [STM - Short-Term Memory]
-            direction LR
-            S1[VDB-1] --- Sn[VDB-n]
+        subgraph STM ["STM - Short-Term Memory"]
+            S1[VDB-1]
+            S2[...]
+            Sn[VDB-n]
         end
 
-        subgraph LTM [LTM - Long-Term Memory]
-            direction LR
-            L1[VDB-1] --- Ln[VDB-n]
+        subgraph LTM ["LTM - Long-Term Memory"]
+            L1[VDB-1]
+            L2[...]
+            Ln[VDB-n]
         end
 
-        subgraph RawCache [Raw Logs - Immutable Archive]
-            direction LR
-            R1[Log 1] --- Rn[Log n]
+        subgraph RawCache ["Raw Logs - Immutable Archive"]
+            R1[Log 1]
+            R2[...]
+            Rn[Log n]
         end
     end
 
-    %% --- FLOWS ---
     USER --> CA
     ENV --> CA
-    CA -->|1. Get relevant context| Retriever
-    CA -->|4. Context missing, save this| Listener
-    Retriever -->|2. Search Index| GraphDB
-    GraphDB -.->|3a. Pointers| STM
-    GraphDB -.->|3b. Pointers| LTM
-    GraphDB -.->|3c. Pointers| RawCache
-    Retriever -->|3d. Read selective data| STM
-    Retriever -->|3d. Read selective data| LTM
-    Retriever -->|3d. Read selective data| RawCache
-    Listener -->|5. Save, Optimize & Update| STM
-    Listener -->|5. Save, Optimize & Update| LTM
-    Listener -->|5. Save, Optimize & Update| RawCache
-    Listener -->|5. Save, Optimize & Update| GraphDB
+    CA -->|"1. Get relevant context"| Retriever
+    CA -->|"4. Context missing, save this"| Listener
+    Retriever -->|"2. Search Index"| GraphDB
+    GraphDB -.->|"3a. Pointers"| STM
+    GraphDB -.->|"3b. Pointers"| LTM
+    GraphDB -.->|"3c. Pointers"| RawCache
+    Retriever -->|"3d. Read selective data"| STM
+    Retriever -->|"3d. Read selective data"| LTM
+    Retriever -->|"3d. Read selective data"| RawCache
+    Listener -->|"5. Save, Optimize & Update"| STM
+    Listener -->|"5. Save, Optimize & Update"| LTM
+    Listener -->|"5. Save, Optimize & Update"| RawCache
+    Listener -->|"5. Save, Optimize & Update"| GraphDB
 ```
 
 ## 🚀 Key Features
