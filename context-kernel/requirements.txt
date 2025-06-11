@@ -1,0 +1,4 @@
+fastapi
+streamlit
+pydantic
+pytest
