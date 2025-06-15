@@ -116,8 +116,27 @@
 import logging
 import asyncio
 import datetime
-from typing import Any, Dict, List, Optional, Union # Added Union for Pydantic Field default_factory
-from pydantic import BaseModel, Field, HttpUrl # HttpUrl might be useful later
+from typing import Any, Dict, List, Optional, Union
+from pydantic import BaseModel, Field, BaseSettings
+
+try:
+    from transformers import pipeline, Pipeline
+except ImportError:
+    pipeline = None # Placeholder if transformers is not installed
+    Pipeline = None # type: ignore # Placeholder for type hinting
+
+
+# Configuration Model for LLMListener
+class LLMListenerConfig(BaseSettings):
+    summarization_model_name: str = "t5-small"
+    entity_extraction_model_name: str = "dbmdz/bert-large-cased-finetuned-conll03-english"
+    enable_stub_relation_extraction: bool = False
+    default_summarization_min_length: int = 30
+    default_summarization_max_length: int = 150
+
+    class Config:
+        env_prefix = 'LLM_LISTENER_' # e.g., LLM_LISTENER_SUMMARIZATION_MODEL_NAME
+
 
 # Placeholder Memory System Interfaces (would typically be imported)
 class BaseMemorySystem: # Base class for type hinting
@@ -199,20 +218,59 @@ class StructuredInsight(TimestampedModel):
 
 class LLMListener:
     def __init__(self,
-                 llm_config: Dict[str, Any],
+                 listener_config: LLMListenerConfig, # Updated parameter name and type
                  memory_systems: Dict[str, BaseMemorySystem],
                  data_processing_config: Optional[Dict[str, Any]] = None,
-                 llm_client: Optional[Any] = None): # Added llm_client
+                 llm_client: Optional[Any] = None):
         self.logger = logging.getLogger(__name__)
-        self.llm_config = llm_config
+        self.listener_config = listener_config # Store the new config object
         self.memory_systems = memory_systems
         self.data_processing_config = data_processing_config if data_processing_config is not None else {}
-        self.llm_client = llm_client # Store the llm_client
+        self.llm_client = llm_client # External client, kept for now
+        self.summarization_pipeline: Optional[Pipeline] = None
+        self.ner_pipeline: Optional[Pipeline] = None
 
-        self.logger.info(f"LLMListener initialized with llm_config: {self.llm_config}, "
-                         f"memory_systems: {list(self.memory_systems.keys())}, " # Log keys to avoid large object logging
-                         f"data_processing_config: {self.data_processing_config}, "
-                         f"llm_client provided: {self.llm_client is not None}")
+        if pipeline is None:
+            self.logger.warning(
+                "transformers library not installed. Summarization and NER features will be largely unavailable. "
+                "Please install with: pip install transformers torch sentencepiece"
+            )
+        else:
+            # Initialize Summarization Pipeline
+            self.logger.info(f"Attempting to initialize summarization pipeline with model: {self.listener_config.summarization_model_name}")
+            try:
+                self.summarization_pipeline = pipeline(
+                    "summarization",
+                    model=self.listener_config.summarization_model_name,
+                    tokenizer=self.listener_config.summarization_model_name,
+                )
+                self.logger.info(f"Summarization pipeline initialized successfully with model: {self.listener_config.summarization_model_name}")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize summarization pipeline with model {self.listener_config.summarization_model_name}: {e}", exc_info=True)
+                self.summarization_pipeline = None
+
+            # Initialize NER Pipeline
+            self.logger.info(f"Attempting to initialize NER pipeline with model: {self.listener_config.entity_extraction_model_name}")
+            try:
+                self.ner_pipeline = pipeline(
+                    "ner",
+                    model=self.listener_config.entity_extraction_model_name,
+                    tokenizer=self.listener_config.entity_extraction_model_name,
+                )
+                self.logger.info(f"NER pipeline initialized successfully with model: {self.listener_config.entity_extraction_model_name}")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize NER pipeline with model {self.listener_config.entity_extraction_model_name}: {e}", exc_info=True)
+                self.ner_pipeline = None
+
+        self.logger.info(
+            f"LLMListener initialized. "
+            f"Summarization pipeline ready: {self.summarization_pipeline is not None}. "
+            f"NER pipeline ready: {self.ner_pipeline is not None}. "
+            f"Listener Config: {self.listener_config.model_dump_json(indent=2)}, " # Log new config
+            f"Memory Systems: {list(self.memory_systems.keys())}, "
+            f"Data Processing Config: {self.data_processing_config}, "
+            f"External LLM Client provided: {self.llm_client is not None}"
+        )
 
     async def _preprocess_data(self, raw_data: Any) -> Any:
         """Placeholder for data preprocessing logic."""
@@ -224,52 +282,137 @@ class LLMListener:
     async def _call_llm_summarize(self, text_content: Any, instructions: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """Stub for calling LLM for summarization."""
         self.logger.info(f"Attempting to summarize content with instructions: {instructions}")
-        self.logger.debug(f"LLM Summarize - Text content: {text_content}, Instructions: {instructions}, LLM Config: {self.llm_config.get('summarization_model')}")
+        self.logger.debug(f"Text content for summarization (first 100 chars): {str(text_content)[:100]}")
 
-        if self.llm_client and hasattr(self.llm_client, 'summarize'):
-            try:
-                # Assuming instructions might contain 'max_length' or similar parameters
-                max_length = instructions.get('max_length', 100) if instructions else 100
-                summary_text = await self.llm_client.summarize(str(text_content), max_length=max_length)
-                self.logger.info(f"Summarization via llm_client successful.")
+        if not self.summarization_pipeline:
+            self.logger.warning("Summarization pipeline not available. Returning None.")
+            if self.llm_client and hasattr(self.llm_client, 'summarize'):
+                self.logger.info("Attempting summarization with external llm_client as fallback.")
+                try:
+                    # Use configured defaults if not in instructions for external client too
+                    default_max_length_ext = self.listener_config.default_summarization_max_length
+                    max_length_ext = instructions.get('max_length', default_max_length_ext) if instructions else default_max_length_ext
+
+                    summary_text = await self.llm_client.summarize(str(text_content), max_length=max_length_ext)
+                    self.logger.info("Summarization via external llm_client successful.")
+                    return summary_text
+                except Exception as e:
+                    self.logger.error(f"Error during summarization with external llm_client: {e}", exc_info=True)
+                    return None
+            self.logger.warning("No summarization method available (pipeline or client).")
+            return None
+
+        try:
+            # Default summarization parameters from listener_config
+            min_length_default = self.listener_config.default_summarization_min_length
+            max_length_default = self.listener_config.default_summarization_max_length
+
+            min_length = instructions.get('min_length', min_length_default) if instructions else min_length_default
+            max_length = instructions.get('max_length', max_length_default) if instructions else max_length_default
+
+            # Log that the call is synchronous
+            self.logger.info(
+                "Calling Hugging Face summarization pipeline (synchronous call within async method). "
+                f"Params: min_length={min_length}, max_length={max_length}"
+            )
+
+            # The pipeline expects a list of texts. We are summarizing one chunk at a time.
+            # For very long texts that exceed model limits, chunking might be needed before this call.
+            # However, this method processes a `text_chunk` which is assumed to be manageable.
+            summary_results = self.summarization_pipeline(
+                str(text_content),
+                min_length=min_length,
+                max_length=max_length,
+                truncation=True # Ensure text is truncated if too long for the model
+            )
+
+            if summary_results and isinstance(summary_results, list) and summary_results[0].get('summary_text'):
+                summary_text = summary_results[0]['summary_text']
+                self.logger.info("Hugging Face summarization successful.")
+                self.logger.debug(f"Generated summary: {summary_text}")
                 return summary_text
-            except Exception as e:
-                self.logger.error(f"Error during summarization with llm_client: {e}", exc_info=True)
-                # Fallback to old stub or handle error appropriately
-
-        # Fallback to old stub if no llm_client or if client call fails
-        await asyncio.sleep(0) # Simulate async LLM call
-        self.logger.info("Using fallback stub summarization in _call_llm_summarize.")
-        return f"This is a stubbed summary of: {str(text_content)[:50]}..."
+            else:
+                self.logger.error(f"Summarization did not return expected output format. Result: {summary_results}")
+                return None
+        except Exception as e:
+            self.logger.error(f"Error during Hugging Face summarization pipeline execution: {e}", exc_info=True)
+            return None
 
     async def _call_llm_extract_entities(self, text_content: Any, instructions: Optional[Dict[str, Any]] = None) -> Optional[List[Dict[str, Any]]]:
-        """Stub for calling LLM for entity extraction."""
-        self.logger.info(f"Attempting to extract entities from content with instructions: {instructions}")
-        self.logger.debug(f"LLM Extract Entities - Text content: {text_content}, Instructions: {instructions}, LLM Config: {self.llm_config.get('entity_extraction_model')}")
-        await asyncio.sleep(0) # Simulate async LLM call
-        return [
-            {"text": "StubEntity1", "type": "PERSON", "context": str(text_content)[:30]},
-            {"text": "StubEntity2", "type": "LOCATION", "context": str(text_content)[:30]}
-        ]
+        """Extracts entities using Hugging Face NER pipeline."""
+        self.logger.info(f"Attempting to extract entities. Instructions: {instructions}")
+        self.logger.debug(f"Text content for NER (first 100 chars): {str(text_content)[:100]}")
+
+        if not self.ner_pipeline:
+            self.logger.warning("NER pipeline not available. Returning empty list.")
+            # Optionally, could add a fallback to self.llm_client if it has an NER method.
+            return []
+
+        try:
+            self.logger.info("Calling Hugging Face NER pipeline (synchronous call within async method).")
+            ner_results = self.ner_pipeline(str(text_content))
+
+            extracted_entities = []
+            if ner_results and isinstance(ner_results, list):
+                for entity in ner_results:
+                    # Default NER pipeline output: {'entity_group': 'PER', 'score': 0.99, 'word': 'Wolfgang', 'start': 0, 'end': 8}
+                    # We need to transform this.
+                    entity_text = entity.get('word')
+                    entity_type = entity.get('entity_group', 'UNKNOWN') # Some models use 'entity_group', others 'label'
+
+                    # Create a small context snippet
+                    start_offset = entity.get('start', 0)
+                    end_offset = entity.get('end', 0)
+                    context_window = 30 # Characters before and after
+                    context_start = max(0, start_offset - context_window)
+                    context_end = min(len(str(text_content)), end_offset + context_window)
+                    context_snippet = f"...{str(text_content)[context_start:start_offset]}[{entity_text}]{str(text_content)[end_offset:context_end]}..."
+
+                    extracted_entities.append({
+                        "text": entity_text,
+                        "type": entity_type,
+                        "context": context_snippet,
+                        "score": entity.get('score'),
+                        "start_char": start_offset,
+                        "end_char": end_offset
+                    })
+                self.logger.info(f"Hugging Face NER successful. Extracted {len(extracted_entities)} entities.")
+                self.logger.debug(f"Extracted entities: {extracted_entities}")
+                return extracted_entities
+            else:
+                self.logger.warning(f"NER pipeline did not return expected list format. Result: {ner_results}")
+                return []
+        except Exception as e:
+            self.logger.error(f"Error during Hugging Face NER pipeline execution: {e}", exc_info=True)
+            return [] # Return empty list on error, or None if preferred
 
     async def _call_llm_extract_relations(self, text_content: Any, entities: Optional[List[Dict[str, Any]]], instructions: Optional[Dict[str, Any]] = None) -> Optional[List[Dict[str, Any]]]:
-        """Stub for calling LLM for relation extraction."""
-        self.logger.info(f"Attempting to extract relations from content with entities: {entities} and instructions: {instructions}")
-        self.logger.debug(f"LLM Extract Relations - Text content: {text_content}, Entities: {entities}, Instructions: {instructions}, LLM Config: {self.llm_config.get('relation_extraction_model')}")
-        await asyncio.sleep(0) # Simulate async LLM call
-        if entities and len(entities) >= 2:
-            return [{
+        """Placeholder for relation extraction. Currently returns a stubbed example or empty list."""
+        self.logger.info(f"Attempting to extract relations (placeholder implementation). Entities: {entities}, Instructions: {instructions}")
+
+        # This is a placeholder. True LLM-based relation extraction is complex and would require
+        # a dedicated pipeline or sophisticated prompting with a text-generation/QA model.
+        # For now, we return a stub or an empty list, based on config.
+        if self.listener_config.enable_stub_relation_extraction and entities and len(entities) >= 2:
+            # Only return a stub if explicitly enabled and enough entities exist
+            self.logger.debug(f"Using stubbed relation extraction (enabled by config). Text content (first 100 chars): {str(text_content)[:100]}")
+            example_relation = {
                 "subject": entities[0]['text'],
                 "verb": "is_related_to_stub",
                 "object": entities[1]['text'],
-                "context": str(text_content)[:30]
-            }]
-        return [{"subject": "UnknownSubject", "verb": "has_stub_relation", "object": "UnknownObject"}]
+                "context": f"Stub context from: {str(text_content)[:50]}..."
+            }
+            self.logger.info(f"Returning stubbed relation: {example_relation}")
+            return [example_relation]
 
-    async def _generate_insights(self, data: Any, context_instructions: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        self.logger.info("Relation extraction placeholder: No relations extracted or stub disabled.")
+        return []
+
+    async def _generate_insights(self, data: Any, context_instructions: Optional[Dict[str, Any]], raw_data_doc_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Generates insights from data using LLM calls (stubs).
+        Generates insights from data using LLM calls.
         Orchestrates calls for summarization, entity extraction, and relation extraction.
+        Includes raw_data_doc_id in the returned insights if provided.
         """
         self.logger.info(f"Starting insight generation for data. Instructions: {context_instructions}")
         self.logger.debug(f"Data for insight generation: {data}")
@@ -312,11 +455,13 @@ class LLMListener:
             self.logger.info("Skipping relation extraction based on context_instructions.")
 
         self.logger.info("Insight generation process completed.")
-        return {"summary": summary, "entities": entities, "relations": relations, "original_data": data}
+        # Include raw_data_doc_id in the returned dictionary
+        return {"summary": summary, "entities": entities, "relations": relations, "original_data": data, "raw_data_doc_id": raw_data_doc_id}
 
-    async def _structure_data(self, insights: Dict[str, Any], raw_data_id_val: Optional[str] = None) -> StructuredInsight:
+    async def _structure_data(self, insights: Dict[str, Any]) -> StructuredInsight:
         """
         Structures the generated insights into Pydantic models.
+        The 'insights' dictionary is expected to contain 'raw_data_doc_id' if available.
         """
         self.logger.info("Starting data structuring with Pydantic models...")
         self.logger.debug(f"Received insights for structuring: {insights}")
@@ -325,11 +470,12 @@ class LLMListener:
         entity_list = insights.get("entities") # Expected to be List[Dict]
         relation_list = insights.get("relations") # Expected to be List[Dict]
         original_data = insights.get("original_data")
+        # Get raw_data_id from insights, which should have been passed down if generated
+        raw_data_id_val = insights.get("raw_data_doc_id")
 
         summary_obj: Optional[Summary] = None
         if summary_text:
-            # In a real scenario, source_data_hash might be generated from original_data
-            summary_obj = Summary(text=summary_text, source_data_hash=None)
+            summary_obj = Summary(text=summary_text, source_data_hash=None) # Hash could be added
 
         entity_objects: Optional[List[Entity]] = None
         if entity_list:
@@ -357,96 +503,91 @@ class LLMListener:
             summary=summary_obj,
             entities=entity_objects,
             relations=relation_objects,
-            raw_data_id=raw_data_id_val # Pass the ID from raw cache storage if available
+            raw_data_id=raw_data_id_val # This now comes from the insights dict
         )
 
-        await asyncio.sleep(0) # Simulate async work if any complex transformation were done
+        # No async work typically needed here, Pydantic model creation is synchronous.
+        # await asyncio.sleep(0)
 
         self.logger.info("Data structuring with Pydantic models completed.")
-        self.logger.debug(f"StructuredInsight object created: {structured_insight.model_dump_json(indent=2)}") # Pydantic v2
+        self.logger.debug(f"StructuredInsight object created: {structured_data.model_dump_json(indent=2)}") # Pydantic v2 preferred
 
         return structured_insight
 
-    async def _write_to_memory(self, structured_data: StructuredInsight, raw_data_doc_id: Optional[str] = None) -> None:
+    async def _write_to_memory(self, structured_data: StructuredInsight) -> None:
         """
-        Writes StructuredInsight data to appropriate memory systems (stubs).
+        Writes StructuredInsight data to appropriate memory systems.
+        Assumes structured_data.raw_data_id is populated if raw data was cached.
         Uses conditional logic based on available data and memory system clients.
         """
         self.logger.info("Starting memory writing operations with StructuredInsight...")
         self.logger.debug(f"StructuredInsight for memory: {structured_data.model_dump_json(indent=2)}")
 
-        # Use created_at from the StructuredInsight model as a consistent ID if available
-        # otherwise, fallback to a new timestamp. This assumes raw_data_doc_id is for the raw data itself.
-        doc_id_base = structured_data.created_at.isoformat()
+        # Use created_at from the StructuredInsight model as a consistent ID base.
+        # structured_data.raw_data_id can also serve as a base or part of it if available.
+        doc_id_base = structured_data.raw_data_id if structured_data.raw_data_id else structured_data.created_at.isoformat()
 
         # Retrieve memory system clients
         stm: Optional[STMInterface] = self.memory_systems.get("stm") # type: ignore
         ltm: Optional[LTMInterface] = self.memory_systems.get("ltm") # type: ignore
         graph_db: Optional[GraphDBInterface] = self.memory_systems.get("graph_db") # type: ignore
-        # raw_cache client is used before this method now, to get raw_data_doc_id
-        # So, it's not directly used here for storing raw_data_source anymore.
-        # raw_data_source is also not passed here anymore.
 
-        try:
-            # Raw data is assumed to be stored before this method, and raw_data_doc_id is passed.
-            # The StructuredInsight model now contains raw_data_id.
+        # Write summary to STM
+        if structured_data.summary and stm:
+            self.logger.info(f"Attempting to write summary to STM (ID base: {doc_id_base})...")
+            try:
+                summary_id = f"{doc_id_base}_summary"
+                await stm.save_summary(summary_id=summary_id,
+                                       summary_obj=structured_data.summary, # Pass the Summary Pydantic model
+                                       metadata={"doc_id_base": doc_id_base, "raw_data_id": structured_data.raw_data_id})
+                self.logger.info(f"Successfully wrote summary to STM with id: {summary_id}")
+            except Exception as e:
+                self.logger.error(f"Failed to write summary to STM: {e}", exc_info=True)
+        elif structured_data.summary and not stm:
+            self.logger.warning("STM client not available, skipping summary storage.")
 
-            # Write summary to STM
-            if structured_data.summary and stm is not None:
-                self.logger.info("Attempting to write summary to STM...")
+        # Write insights (the whole StructuredInsight object) to LTM
+        if ltm: # LTM might always be written to, or conditionally like others
+            self.logger.info(f"Attempting to write document to LTM (ID base: {doc_id_base})...")
+            try:
+                ltm_doc_id = f"{doc_id_base}_ltm_doc"
+                # Pass the full StructuredInsight Pydantic model
+                await ltm.save_document(doc_id=ltm_doc_id,
+                                        document_content=structured_data,
+                                        metadata={"doc_id_base": doc_id_base, "raw_data_id": structured_data.raw_data_id})
+                self.logger.info(f"Successfully wrote document to LTM with id: {ltm_doc_id}")
+            except Exception as e:
+                self.logger.error(f"Failed to write document to LTM: {e}", exc_info=True)
+        else:
+            self.logger.warning("LTM client not available, skipping document storage.")
+
+        # Write entities and relations to GraphDB
+        if graph_db:
+            if structured_data.entities:
+                self.logger.info(f"Attempting to write {len(structured_data.entities)} entities to GraphDB (Doc ID: {doc_id_base})...")
                 try:
-                    # Pass Pydantic model directly or specific fields
-                    await stm.save_summary(summary_id=doc_id_base + "_summary",
-                                           summary_obj=structured_data.summary, # Pass the Summary object
-                                           summary_text=structured_data.summary.text, # Or just the text
-                                           metadata={"doc_id_base": doc_id_base})
-                    self.logger.info(f"Successfully wrote summary to STM with id: {doc_id_base}_summary")
+                    # Pass list of Entity Pydantic models
+                    await graph_db.add_entities(entities=structured_data.entities,
+                                                document_id=doc_id_base, # Link entities to the source document/ID
+                                                metadata={"raw_data_id": structured_data.raw_data_id})
+                    self.logger.info(f"Successfully wrote entities to GraphDB for document_id: {doc_id_base}")
                 except Exception as e:
-                    self.logger.error(f"Failed to write summary to STM: {e}", exc_info=True)
-            elif processed_summary and stm is None:
-                self.logger.warning("STM client not available, skipping summary storage.")
+                    self.logger.error(f"Failed to write entities to GraphDB: {e}", exc_info=True)
 
-            # Write insights (summary, entities) to LTM
-            if (structured_data.summary or structured_data.entities) and ltm is not None:
-                self.logger.info("Attempting to write insights to LTM...")
+            if structured_data.relations:
+                self.logger.info(f"Attempting to write {len(structured_data.relations)} relations to GraphDB (Doc ID: {doc_id_base})...")
                 try:
-                    # LTM might store the whole StructuredInsight model (converted to dict if necessary by client)
-                    # or specific parts.
-                    await ltm.save_document(doc_id=doc_id_base + "_ltm_doc",
-                                            document_content=structured_data, # Pass the StructuredInsight object
-                                            metadata={"doc_id_base": doc_id_base})
-                    self.logger.info(f"Successfully wrote document to LTM with id: {doc_id_base}_ltm_doc")
+                    # Pass list of Relation Pydantic models
+                    await graph_db.add_relations(relations=structured_data.relations,
+                                                 document_id=doc_id_base, # Link relations to the source document/ID
+                                                 metadata={"raw_data_id": structured_data.raw_data_id})
+                    self.logger.info(f"Successfully wrote relations to GraphDB for document_id: {doc_id_base}")
                 except Exception as e:
-                    self.logger.error(f"Failed to write document to LTM: {e}", exc_info=True)
-            elif (processed_summary or structured_data.get("extracted_entities")) and ltm is None:
-                 self.logger.warning("LTM client not available, skipping document storage.")
+                    self.logger.error(f"Failed to write relations to GraphDB: {e}", exc_info=True)
+        elif structured_data.entities or structured_data.relations: # Only warn if there was something to write
+            self.logger.warning("GraphDB client not available, skipping graph data storage.")
 
-
-            # Write entities and relations to GraphDB
-            if (structured_data.entities or structured_data.relations) and graph_db is not None:
-                self.logger.info("Attempting to write to GraphDB...")
-                try:
-                    if structured_data.entities:
-                        # Pass list of Entity Pydantic models
-                        await graph_db.add_entities(entities=structured_data.entities,
-                                                    document_id=doc_id_base,
-                                                    metadata={"doc_id_base": doc_id_base})
-                        self.logger.info(f"Successfully wrote {len(structured_data.entities)} entities to GraphDB for doc_id: {doc_id_base}")
-                    if structured_data.relations:
-                        # Pass list of Relation Pydantic models
-                        await graph_db.add_relations(relations=structured_data.relations,
-                                                     document_id=doc_id_base,
-                                                     metadata={"doc_id_base": doc_id_base})
-                        self.logger.info(f"Successfully wrote {len(structured_data.relations)} relations to GraphDB for doc_id: {doc_id_base}")
-                except Exception as e:
-                    self.logger.error(f"Failed to write to GraphDB: {e}", exc_info=True)
-            elif (entities or relations) and graph_db is None:
-                self.logger.warning("GraphDB client not available, skipping graph data storage.")
-
-            self.logger.info("Memory writing operations completed.")
-
-        except Exception as e:
-            self.logger.error(f"An unexpected error occurred during memory writing operations: {e}", exc_info=True)
+        self.logger.info("Memory writing operations completed.")
 
 
     async def process_data(self, raw_data: Any, context_instructions: Optional[Dict[str, Any]] = None):
@@ -455,21 +596,47 @@ class LLMListener:
         structuring the insights, and writing them to memory systems.
         """
         self.logger.info(f"Received data for processing. Instructions: {context_instructions}")
-        self.logger.debug(f"Raw data: {raw_data}") # Be cautious logging raw_data if it can be very large
+        self.logger.debug(f"Raw data (type: {type(raw_data)}): {str(raw_data)[:200]}...") # Log snippet
 
+        raw_data_doc_id: Optional[str] = None
         try:
             preprocessed_data = await self._preprocess_data(raw_data)
-            self.logger.debug(f"Preprocessed data: {preprocessed_data}")
+            self.logger.debug(f"Preprocessed data (type: {type(preprocessed_data)}): {str(preprocessed_data)[:200]}...")
 
-            insights = await self._generate_insights(preprocessed_data, context_instructions)
+            # Store raw_data in RawCache if available
+            raw_cache_client: Optional[RawCacheInterface] = self.memory_systems.get("raw_cache") # type: ignore
+            if raw_cache_client:
+                try:
+                    # Generate a unique ID for the raw data document
+                    # Using timestamp and a part of the data hash could be an option for uniqueness
+                    # For simplicity, using a timestamp-based ID here.
+                    raw_doc_id_timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    # A more robust ID might involve hashing preprocessed_data if it's consistently hashable
+                    # raw_data_hash = hashlib.sha256(str(preprocessed_data).encode()).hexdigest()[:16]
+                    # temp_raw_id = f"raw_{raw_doc_id_timestamp}_{raw_data_hash}"
+                    temp_raw_id = f"raw_{raw_doc_id_timestamp}" # Simplified ID
+
+                    self.logger.info(f"Attempting to store preprocessed data in RawCache with tentative ID: {temp_raw_id}")
+                    # The store method is expected to return the actual ID used (could be same or different)
+                    raw_data_doc_id = await raw_cache_client.store(doc_id=temp_raw_id, data=preprocessed_data)
+                    self.logger.info(f"Successfully stored data in RawCache. Document ID: {raw_data_doc_id}")
+                except Exception as e:
+                    self.logger.error(f"Failed to store data in RawCache: {e}", exc_info=True)
+                    # Decide if processing should continue without raw_cache_id or halt.
+                    # For now, we'll continue, and raw_data_doc_id will remain None.
+
+            # Pass raw_data_doc_id to insight generation
+            insights = await self._generate_insights(preprocessed_data, context_instructions, raw_data_doc_id=raw_data_doc_id)
             self.logger.debug(f"Generated insights: {insights}")
 
+            # raw_data_doc_id is already in 'insights' if generated, _structure_data will pick it up.
             structured_data = await self._structure_data(insights)
-            self.logger.debug(f"Structured data: {structured_data}")
+            self.logger.debug(f"Structured data: {structured_data.model_dump_json(indent=2)}")
 
-            await self._write_to_memory(structured_data, raw_data_source=raw_data)
+            # _write_to_memory no longer needs raw_data_source, it uses structured_data.raw_data_id
+            await self._write_to_memory(structured_data)
 
             self.logger.info("Data processing completed successfully.")
         except Exception as e:
-            self.logger.error(f"Error during data processing: {e}", exc_info=True)
+            self.logger.error(f"Error during data processing pipeline: {e}", exc_info=True)
             # Potentially re-raise or handle specific exceptions as needed
