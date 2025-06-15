@@ -301,9 +301,10 @@ class Summarizer:
 
         # Simulate API call to an LLM
         logger.info("Simulating API call to an LLM for abstractive summarization.")
-        api_key = os.getenv(config.llm_api_key_env if config.llm_api_key_env else "OPENAI_API_KEY") # Default env var if not set
+        env_var_name = config.llm_api_key_env or "OPENAI_API_KEY"
+        api_key = os.getenv(env_var_name)
         api_key_found = bool(api_key)
-        logger.info(f"API key from env var '{config.llm_api_key_env or "OPENAI_API_KEY"}' found: {api_key_found}")
+        logger.info(f"API key from env var '{env_var_name}' found: {api_key_found}")
 
         mock_payload = {
             "text_to_summarize": text,
@@ -325,9 +326,10 @@ class Summarizer:
         #   e.g., `summarizer = pipeline("summarization", model=config.model_name or "facebook/bart-large-cnn")`
         #   `result = summarizer(text, max_length=..., min_length=..., do_sample=False)`
 
+        env_var_name_for_summary = config.llm_api_key_env or "OPENAI_API_KEY"
         summary = (
             f"Abstractive summary of '{text[:50]}...' (simulated using model: "
-            f"{config.model_name or 'default_LLM'}). API Key ({config.llm_api_key_env or "OPENAI_API_KEY"}) found: {api_key_found}."
+            f"{config.model_name or 'default_LLM'}). API Key ({env_var_name_for_summary}) found: {api_key_found}."
         )
 
         logger.info(f"Generated stubbed abstractive summary: {summary}")

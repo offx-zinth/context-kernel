@@ -201,15 +201,18 @@ class LLMListener:
     def __init__(self,
                  llm_config: Dict[str, Any],
                  memory_systems: Dict[str, BaseMemorySystem],
-                 data_processing_config: Optional[Dict[str, Any]] = None):
+                 data_processing_config: Optional[Dict[str, Any]] = None,
+                 llm_client: Optional[Any] = None): # Added llm_client
         self.logger = logging.getLogger(__name__)
         self.llm_config = llm_config
         self.memory_systems = memory_systems
         self.data_processing_config = data_processing_config if data_processing_config is not None else {}
+        self.llm_client = llm_client # Store the llm_client
 
         self.logger.info(f"LLMListener initialized with llm_config: {self.llm_config}, "
                          f"memory_systems: {list(self.memory_systems.keys())}, " # Log keys to avoid large object logging
-                         f"data_processing_config: {self.data_processing_config}")
+                         f"data_processing_config: {self.data_processing_config}, "
+                         f"llm_client provided: {self.llm_client is not None}")
 
     async def _preprocess_data(self, raw_data: Any) -> Any:
         """Placeholder for data preprocessing logic."""
@@ -222,8 +225,21 @@ class LLMListener:
         """Stub for calling LLM for summarization."""
         self.logger.info(f"Attempting to summarize content with instructions: {instructions}")
         self.logger.debug(f"LLM Summarize - Text content: {text_content}, Instructions: {instructions}, LLM Config: {self.llm_config.get('summarization_model')}")
+
+        if self.llm_client and hasattr(self.llm_client, 'summarize'):
+            try:
+                # Assuming instructions might contain 'max_length' or similar parameters
+                max_length = instructions.get('max_length', 100) if instructions else 100
+                summary_text = await self.llm_client.summarize(str(text_content), max_length=max_length)
+                self.logger.info(f"Summarization via llm_client successful.")
+                return summary_text
+            except Exception as e:
+                self.logger.error(f"Error during summarization with llm_client: {e}", exc_info=True)
+                # Fallback to old stub or handle error appropriately
+
+        # Fallback to old stub if no llm_client or if client call fails
         await asyncio.sleep(0) # Simulate async LLM call
-        # In a real implementation, use self.llm_config to choose model, etc.
+        self.logger.info("Using fallback stub summarization in _call_llm_summarize.")
         return f"This is a stubbed summary of: {str(text_content)[:50]}..."
 
     async def _call_llm_extract_entities(self, text_content: Any, instructions: Optional[Dict[str, Any]] = None) -> Optional[List[Dict[str, Any]]]:
