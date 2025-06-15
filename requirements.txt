@@ -1,0 +1,20 @@
+# Core ML/NLP
+transformers
+torch
+spacy
+# Faiss for vector similarity search (optional, can be added later)
+# faiss-cpu
+# networkx for graph operations
+networkx
+# API framework (if exposing an API)
+fastapi
+uvicorn[standard]
+pydantic
+# For data handling and utilities
+numpy
+pandas
+python-dotenv
+# For DB connectors (examples, add specific ones as needed)
+# psycopg2-binary # For PostgreSQL
+# pymongo # For MongoDB
+# neo4j # For Neo4j
