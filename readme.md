@@ -109,8 +109,17 @@ ContextKernel operates on a sophisticated dual-loop system for reading and writi
 ## 📦 Installation
 
 ```bash
-pip install contextkernel
+# Clone the repository:
+git clone https://github.com/your-repo/contextkernel.git
+cd contextkernel
+
+# Install dependencies:
+pip install -r requirements.txt
+
+# Install the package in editable mode:
+pip install -e .
 ```
+Note: The PyPI installation (`pip install contextkernel`) will be available for future stable releases.
 
 ## ⚡ Quick Start
 
@@ -135,6 +144,21 @@ print(response)
 # staging logs and the incident report from May, without you having to
 # manually load any documents.
 ```
+
+## 🏗️ Project Structure
+
+The ContextKernel project is organized as follows:
+
+- **`contextkernel/`**: The main package directory.
+  - **`core_logic/`**: Contains the core reasoning and orchestration modules like the Context Agent, LLM Retriever, LLM Listener, and Summarizer.
+  - **`memory_system/`**: Houses the components for the multi-tier memory, including interfaces for Graph DB, Short-Term Memory (STM), Long-Term Memory (LTM), Raw Cache, and the Graph Indexer.
+  - **`interfaces/`**: Provides API endpoints and the Python SDK for interacting with the kernel.
+  - **`utils/`**: Includes utility functions, configuration management, and helper scripts.
+  - **`tests/`**: Contains unit and integration tests for the various components of the kernel.
+- **`readme.md`**: This file.
+- **`requirements.txt`**: Project dependencies.
+- **`setup.py`**: Package installation script.
+- **`.gitignore`**: Specifies intentionally untracked files that Git should ignore.
 
 ## ContextKernel vs. Simple RAG
 
