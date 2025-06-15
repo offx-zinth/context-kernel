@@ -214,6 +214,14 @@ class ContextAgent:
                 intent_val = "save_info"
                 entities_val = {"data": processed_input.replace("save", "", 1).strip()}
                 confidence_val = 0.85
+            elif "summarize" in processed_input:
+                intent_val = "summarization_intent"
+                # Basic extraction: find "summarize " and take the rest.
+                # More robust extraction would be needed for varied phrasing.
+                summary_query_parts = processed_input.split("summarize ", 1)
+                text_to_summarize = summary_query_parts[1] if len(summary_query_parts) > 1 else processed_input
+                entities_val = {"text_to_summarize": text_to_summarize.strip()}
+                confidence_val = 0.9 # High confidence for keyword match
 
             self.logger.debug(f"Successfully detected intent='{intent_val}', entities={entities_val}, confidence={confidence_val}")
             return IntentExtractionResult(
@@ -254,7 +262,18 @@ class ContextAgent:
                 task_parameters_val = current_entities
             elif current_intent == "save_info":
                 target_module_val = "LLMListener"
-                task_parameters_val = current_entities
+                task_parameters_val = current_entities # e.g., {"data": "text to save"}
+            elif current_intent == "summarization_intent":
+                target_module_val = "LLMListener" # Or a dedicated SummarizationService if we had one
+                # LLMListener's process_data expects `raw_data` and `context_instructions`.
+                # We need to map `entities_val` ({"text_to_summarize": ...}) to this.
+                # The `llm_service.process` method (which MockContextAgentLLMService implements)
+                # will receive these task_parameters_val.
+                # It will then need to call LLMListener.process_data appropriately.
+                task_parameters_val = {
+                    "raw_data": current_entities.get("text_to_summarize"),
+                    "context_instructions": {"process_for_summarization": True, "summarize": True} # Signal to LLMListener
+                }
             elif current_intent == "unknown_intent":
                 target_module_val = "ErrorHandler"
                 task_parameters_val = {"error_message": "Unknown intent detected.", "original_intent_info": intent_result.dict()}
@@ -302,10 +321,10 @@ class ContextAgent:
                 if self.llm_service and hasattr(self.llm_service, 'retrieve'):
                     self.logger.debug(f"Calling self.llm_service.retrieve with {task_params}")
                     # Actual call to service; response_data would be its result
-                    # response_data = await self.llm_service.retrieve(task_params)
+                    response_data = await self.llm_service.retrieve(task_params)
                     # Mocking service call for now
-                    mock_data = f"Retrieved data for query: '{task_params.get('query', 'N/A')}'"
-                    return TaskResult(status="success", data=mock_data, message="LLMRetriever processed successfully.")
+                    # mock_data = f"Retrieved data for query: '{task_params.get('query', 'N/A')}'"
+                    return TaskResult(status="success", data=response_data, message="LLMRetriever processed successfully.")
                 else:
                     self.logger.warn(f"LLMRetriever (self.llm_service or retrieve method) not available. Task params: {task_params}")
                     return TaskResult(status="error", message="LLMRetriever service not available.", error_details=task_params)
@@ -313,9 +332,9 @@ class ContextAgent:
             elif target_module == "LLMListener":
                 if self.llm_service and hasattr(self.llm_service, 'process'):
                     self.logger.debug(f"Calling self.llm_service.process with {task_params}")
-                    # response_data = await self.llm_service.process(task_params)
-                    mock_data = f"Processed data: '{task_params.get('data', 'N/A')}'"
-                    return TaskResult(status="success", data=mock_data, message="LLMListener processed successfully.")
+                    response_data = await self.llm_service.process(task_params)
+                    # mock_data = f"Processed data: '{task_params.get('data', 'N/A')}'"
+                    return TaskResult(status="success", data=response_data, message="LLMListener processed successfully.")
                 else:
                     self.logger.warn(f"LLMListener (self.llm_service or process method) not available. Task params: {task_params}")
                     return TaskResult(status="error", message="LLMListener service not available.", error_details=task_params)
