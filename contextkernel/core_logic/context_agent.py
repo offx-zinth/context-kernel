@@ -114,20 +114,8 @@
 #     to refine routing rules or retrain routing models.
 
 import logging
-from typing import Dict, Any, List, Optional as TypingOptional # Renamed to avoid conflict with Pydantic's Optional
-from pydantic import BaseModel, Field, BaseSettings
-import spacy
-from spacy.matcher import Matcher
-
-# Configuration Model
-class ContextAgentConfig(BaseSettings):
-    spacy_model_name: str = "en_core_web_sm"
-    low_confidence_threshold: float = 0.6
-    default_intent_confidence: float = 0.5  # For fallback mechanisms
-    high_confidence_threshold: float = 0.8 # For spaCy rule matches
-
-    class Config:
-        env_prefix = 'CONTEXT_AGENT_' # Example: CONTEXT_AGENT_SPACY_MODEL_NAME
+from typing import Dict, Any, Optional as TypingOptional # Renamed to avoid conflict with Pydantic's Optional
+from pydantic import BaseModel, Field
 
 # Pydantic Models for Data Structuring
 class IntentExtractionResult(BaseModel):
@@ -135,11 +123,6 @@ class IntentExtractionResult(BaseModel):
     entities: Dict[str, Any] = Field(default_factory=dict)
     confidence: TypingOptional[float] = None
     original_input: TypingOptional[str] = None # For error cases or context
-    spacy_doc: Any = None # To store the spaCy Doc object, not serialized by default
-    matched_patterns: List[Dict[str, Any]] = Field(default_factory=list)
-
-    class Config:
-        arbitrary_types_allowed = True # Allow Any type for spacy_doc
 
 class RoutingDecision(BaseModel):
     target_module: str
@@ -153,59 +136,25 @@ class TaskResult(BaseModel):
     error_details: TypingOptional[Dict[str, Any]] = None # For structured error info
 
 class ContextAgent:
-    def __init__(self, llm_service, memory_system, agent_config: ContextAgentConfig, state_manager=None):
+    def __init__(self, llm_service, memory_system, config, state_manager=None):
         """
         Initializes the ContextAgent.
 
         Args:
             llm_service: Stub for the LLM service.
             memory_system: Stub for the memory system.
-            agent_config: Configuration object for the ContextAgent.
+            config: Stub for the configuration.
             state_manager: Optional. Instance for managing conversation state.
         """
         self.llm_service = llm_service
         self.memory_system = memory_system
-        self.agent_config = agent_config # Store the config object
+        self.config = config
         self.state_manager = state_manager
         self.logger = logging.getLogger(__name__)
-        try:
-            self.logger.info(f"Loading spaCy model: {self.agent_config.spacy_model_name}")
-            self.nlp = spacy.load(self.agent_config.spacy_model_name)
-            self.matcher = Matcher(self.nlp.vocab)
-            self._initialize_matchers()
-            self.logger.info(f"ContextAgent initialized with spaCy model '{self.agent_config.spacy_model_name}' and matchers.")
-        except Exception as e:
-            self.logger.error(f"Error loading spaCy model '{self.agent_config.spacy_model_name}' or initializing matchers: {e}", exc_info=True)
-            self.nlp = None
-            self.matcher = None
-
         if self.state_manager:
             self.logger.info("ContextAgent initialized with StateManager.")
         else:
             self.logger.info("ContextAgent initialized (no StateManager).") # Kept as INFO as it's a significant config detail
-
-    def _initialize_matchers(self):
-        """Initializes spaCy Matcher rules."""
-        if not self.matcher:
-            return
-
-        # Pattern for "search_info"
-        pattern_search_1 = [{"LOWER": "search"}, {"IS_ASCII": True, "OP": "+"}] # "search <something>"
-        pattern_search_2 = [{"LOWER": "find"}, {"IS_ASCII": True, "OP": "+"}] # "find <something>"
-        pattern_search_3 = [{"LOWER": "look"}, {"LOWER": "up"}, {"IS_ASCII": True, "OP": "+"}] # "look up <something>"
-        self.matcher.add("search_info", [pattern_search_1, pattern_search_2, pattern_search_3])
-
-        # Pattern for "save_info"
-        pattern_save_1 = [{"LOWER": "save"}, {"IS_ASCII": True, "OP": "+"}] # "save <something>"
-        pattern_save_2 = [{"LOWER": "remember"}, {"IS_ASCII": True, "OP": "+"}] # "remember <something>"
-        pattern_save_3 = [{"LOWER": "store"}, {"IS_ASCII": True, "OP": "+"}] # "store <something>"
-        self.matcher.add("save_info", [pattern_save_1, pattern_save_2, pattern_save_3])
-
-        # Pattern for "summarization_intent"
-        pattern_summarize_1 = [{"LOWER": "summarize"}, {"IS_ASCII": True, "OP": "+"}] # "summarize <something>"
-        pattern_summarize_2 = [{"LOWER": "tl;dr"}, {"IS_ASCII": True, "OP": "+"}] # "tl;dr <something>"
-        pattern_summarize_3 = [{"LOWER": "give"}, {"LOWER": "me"}, {"LOWER": "a"}, {"LOWER": "summary"}, {"LOWER": "of"}, {"IS_ASCII": True, "OP": "+"}]
-        self.matcher.add("summarization_intent", [pattern_summarize_1, pattern_summarize_2, pattern_summarize_3])
 
     def process_input(self, raw_input: any) -> str:
         """
@@ -251,105 +200,38 @@ class ContextAgent:
             An IntentExtractionResult object.
         """
         self.logger.debug(f"Attempting to detect intent for: '{processed_input}'")
-        if not self.nlp or not self.matcher:
-            self.logger.error("spaCy nlp model or matcher not initialized. Falling back to basic intent detection.")
-            # Fallback to a very basic keyword check if spaCy is not available
-            if "search" in processed_input: intent_val = "search_info"
-            elif "save" in processed_input: intent_val = "save_info"
-            elif "summarize" in processed_input: intent_val = "summarization_intent"
-            else: intent_val = "unknown_intent"
-            return IntentExtractionResult(
-                intent=intent_val,
-                entities={"error_message": "spaCy model not available"},
-                original_input=processed_input,
-                confidence=self.agent_config.default_intent_confidence # Use config
-            )
-
         try:
-            doc = self.nlp(processed_input)
-            matches = self.matcher(doc)
-
             intent_val = "unknown_intent"
             entities_val = {}
-            # Use default_intent_confidence as a starting point, will be overridden by successful match
-            confidence_val = self.agent_config.default_intent_confidence
-            matched_patterns_details = []
+            confidence_val = 0.5 # Placeholder confidence
 
-            if matches:
-                # For simplicity, take the first match's intent.
-                # More sophisticated logic could prioritize or combine intents.
-                match_id, start, end = matches[0]
-                intent_val = self.nlp.vocab.strings[match_id]
-                span = doc[start:end]  # The matched span
-                matched_text = span.text
-                self.logger.debug(f"Matched span: {matched_text} for intent: {intent_val}")
+            # Placeholder logic for intent detection
+            if "search" in processed_input:
+                intent_val = "search_info"
+                entities_val = {"query": processed_input.replace("search", "", 1).strip()}
+                confidence_val = 0.8 # Higher confidence for keyword match
+            elif "save" in processed_input:
+                intent_val = "save_info"
+                entities_val = {"data": processed_input.replace("save", "", 1).strip()}
+                confidence_val = 0.85
+            elif "summarize" in processed_input:
+                intent_val = "summarization_intent"
+                # Basic extraction: find "summarize " and take the rest.
+                # More robust extraction would be needed for varied phrasing.
+                summary_query_parts = processed_input.split("summarize ", 1)
+                text_to_summarize = summary_query_parts[1] if len(summary_query_parts) > 1 else processed_input
+                entities_val = {"text_to_summarize": text_to_summarize.strip()}
+                confidence_val = 0.9 # High confidence for keyword match
 
-                # Simple entity extraction: consider the text after the matched keyword(s) as the entity
-                # This is a basic approach and can be significantly improved.
-                if intent_val == "search_info":
-                    # Example: "search for cats" -> query: "cats"
-                    # Find the token where the main keyword ends and extract the rest
-                    keyword_end_token_index = 0
-                    if doc[start].lower_ in ["search", "find"]: # first token of match
-                        keyword_end_token_index = start + 1
-                    elif doc[start].lower_ == "look" and doc[start+1].lower_ == "up": # "look up"
-                         keyword_end_token_index = start + 2
-
-                    if keyword_end_token_index < end:
-                         entities_val["query"] = doc[keyword_end_token_index:end].text.strip()
-
-                elif intent_val == "save_info":
-                    keyword_end_token_index = 0
-                    if doc[start].lower_ in ["save", "remember", "store"]:
-                        keyword_end_token_index = start + 1
-
-                    if keyword_end_token_index < end:
-                        entities_val["data"] = doc[keyword_end_token_index:end].text.strip()
-
-                elif intent_val == "summarization_intent":
-                    keyword_end_token_index = 0
-                    if doc[start].lower_ == "summarize":
-                         keyword_end_token_index = start + 1
-                    elif doc[start].lower_ == "tl;dr": # "tl;dr"
-                         keyword_end_token_index = start + 1
-                    elif doc[start].lower_ == "give": # "give me a summary of"
-                        keyword_end_token_index = start + 5
-
-                    if keyword_end_token_index < end:
-                         entities_val["text_to_summarize"] = doc[keyword_end_token_index:end].text.strip()
-
-                # Use high_confidence_threshold for successful spaCy rule matches
-                confidence_val = self.agent_config.high_confidence_threshold
-                for match_id, start, end in matches:
-                    matched_patterns_details.append({
-                        "pattern_name": self.nlp.vocab.strings[match_id],
-                        "matched_text": doc[start:end].text,
-                        "start_token": start,
-                        "end_token": end
-                    })
-            else:
-                self.logger.debug(f"No spaCy Matcher rules matched for: '{processed_input}'")
-                # Optional: Could add simple keyword check as a fallback if no spaCy rules match
-                if "search" in processed_input: intent_val = "search_info"
-                elif "save" in processed_input: intent_val = "save_info"
-                elif "summarize" in processed_input: intent_val = "summarization_intent"
-                # else: intent_val remains "unknown_intent" as initialized
-                # Confidence remains self.agent_config.default_intent_confidence if only basic keyword match
-                if intent_val != "unknown_intent": # Log if basic keyword match changed intent
-                    self.logger.debug(f"No spaCy match, fell back to keyword match for intent: '{intent_val}'")
-
-
-            self.logger.info(f"Detected intent='{intent_val}', entities={entities_val}, confidence={confidence_val} (spaCy match: {bool(matches)}).")
+            self.logger.debug(f"Successfully detected intent='{intent_val}', entities={entities_val}, confidence={confidence_val}")
             return IntentExtractionResult(
                 intent=intent_val,
                 entities=entities_val,
                 confidence=confidence_val,
-                original_input=processed_input,
-                spacy_doc=doc,
-                matched_patterns=matched_patterns_details
+                original_input=processed_input
             )
         except Exception as e:
-            self.logger.error(f"Error during spaCy intent detection for input='{processed_input}': {e}", exc_info=True)
+            self.logger.error(f"Error during intent detection for input='{processed_input}': {e}", exc_info=True)
             return IntentExtractionResult(
                 intent="intent_detection_error",
                 entities={"error_message": str(e)},
@@ -368,52 +250,44 @@ class ContextAgent:
         Returns:
             A RoutingDecision object.
         """
-        self.logger.debug(f"Attempting to decide route for intent_result: Intent='{intent_result.intent}', Confidence='{intent_result.confidence}', Entities='{intent_result.entities}'")
-
-        target_module_val = "ErrorHandler" # Default to ErrorHandler
-        task_parameters_val = {"original_intent_info": intent_result.dict(exclude_none=True)} # Start with full intent info
-
+        self.logger.debug(f"Attempting to decide route for intent_result: {intent_result.dict()}")
         try:
+            target_module_val = ""
+            task_parameters_val = {}
             current_intent = intent_result.intent
             current_entities = intent_result.entities
-            confidence = intent_result.confidence
 
-            if current_intent == "intent_detection_error":
-                task_parameters_val["error_message"] = "Intent detection failed."
-                task_parameters_val["details"] = intent_result.entities.get("error_message", "No specific error details from detection.")
-                self.logger.error(f"Routing to ErrorHandler due to intent_detection_error. Details: {task_parameters_val['details']}")
-
-            elif confidence is None or confidence < self.agent_config.low_confidence_threshold:
-                task_parameters_val["error_message"] = "Intent unclear or confidence too low."
-                task_parameters_val["confidence_score"] = confidence
-                task_parameters_val["detected_intent"] = current_intent
-                self.logger.warn(
-                    f"Routing to ErrorHandler: Intent '{current_intent}' confidence {confidence} is below threshold {self.agent_config.low_confidence_threshold}."
-                )
-            # Clearer routing based on high-confidence intents
-            elif current_intent == "search_info":
+            if current_intent == "search_info":
                 target_module_val = "LLMRetriever"
                 task_parameters_val = current_entities
-                self.logger.info(f"Routing to LLMRetriever for intent '{current_intent}'.")
             elif current_intent == "save_info":
                 target_module_val = "LLMListener"
-                task_parameters_val = current_entities
-                self.logger.info(f"Routing to LLMListener for intent '{current_intent}'.")
+                task_parameters_val = current_entities # e.g., {"data": "text to save"}
             elif current_intent == "summarization_intent":
-                target_module_val = "LLMListener" # Or a dedicated SummarizationService
+                target_module_val = "LLMListener" # Or a dedicated SummarizationService if we had one
+                # LLMListener's process_data expects `raw_data` and `context_instructions`.
+                # We need to map `entities_val` ({"text_to_summarize": ...}) to this.
+                # The `llm_service.process` method (which MockContextAgentLLMService implements)
+                # will receive these task_parameters_val.
+                # It will then need to call LLMListener.process_data appropriately.
                 task_parameters_val = {
                     "raw_data": current_entities.get("text_to_summarize"),
-                    "context_instructions": {"process_for_summarization": True, "summarize": True}
+                    "context_instructions": {"process_for_summarization": True, "summarize": True} # Signal to LLMListener
                 }
-                self.logger.info(f"Routing to LLMListener for intent '{current_intent}'.")
             elif current_intent == "unknown_intent":
-                task_parameters_val["error_message"] = "Unknown intent detected."
-                self.logger.warn(f"Routing to ErrorHandler due to 'unknown_intent'.")
-            else: # Default fallback for any other unrecognized intent string not caught above
-                task_parameters_val["error_message"] = f"Unrecognized high-confidence intent string: {current_intent}"
-                self.logger.warn(f"Routing to ErrorHandler due to unrecognized high-confidence intent: '{current_intent}'.")
+                target_module_val = "ErrorHandler"
+                task_parameters_val = {"error_message": "Unknown intent detected.", "original_intent_info": intent_result.dict()}
+                self.logger.warn(f"Routing to {target_module_val} due to '{current_intent}'. Params: {task_parameters_val}")
+            elif current_intent == "intent_detection_error":
+                target_module_val = "ErrorHandler"
+                task_parameters_val = {"error_message": "Intent detection failed.", "original_intent_info": intent_result.dict()}
+                self.logger.error(f"Routing to {target_module_val} due to intent detection error. Params: {task_parameters_val}")
+            else: # Default fallback for any other unrecognized intent string
+                target_module_val = "ErrorHandler"
+                task_parameters_val = {"error_message": f"Unrecognized intent string: {current_intent}", "original_intent_info": intent_result.dict()}
+                self.logger.warn(f"Routing to {target_module_val} due to unrecognized intent string '{current_intent}'. Params: {task_parameters_val}")
 
-            # Ensure original_intent is part of the final decision for context
+            self.logger.debug(f"Successfully decided route: target_module='{target_module_val}', task_parameters={task_parameters_val}")
             return RoutingDecision(
                 target_module=target_module_val,
                 task_parameters=task_parameters_val,
@@ -440,95 +314,49 @@ class ContextAgent:
         """
         target_module = route.target_module
         task_params = route.task_parameters
-        self.logger.info(f"Attempting to dispatch task to module='{target_module}'.")
-        self.logger.debug(f"Task parameters for dispatch: {task_params}")
-
-        # Default error details in case of early exit or unhandled exception
-        error_details_payload = {"target_module": target_module, "task_parameters": task_params}
+        self.logger.debug(f"Attempting to dispatch task to module='{target_module}' with parameters={task_params}")
 
         try:
             if target_module == "LLMRetriever":
-                if not self.llm_service:
-                    self.logger.error("LLMService (self.llm_service) is not available for LLMRetriever.")
-                    error_details_payload["reason"] = "LLMService not configured."
-                    return TaskResult(status="error", message="LLMRetriever service not configured.", error_details=error_details_payload)
-                if not hasattr(self.llm_service, 'retrieve'):
-                    self.logger.error("LLMService does not have a 'retrieve' method for LLMRetriever.")
-                    error_details_payload["reason"] = "LLMService 'retrieve' method missing."
-                    return TaskResult(status="error", message="LLMRetriever service method 'retrieve' not found.", error_details=error_details_payload)
-
-                query = task_params.get('query')
-                if query is None:
-                    self.logger.error("'query' not found in task_params for LLMRetriever.")
-                    error_details_payload["reason"] = "'query' parameter missing."
-                    return TaskResult(status="error", message="Missing 'query' parameter for LLMRetriever.", error_details=error_details_payload)
-
-                # Prepare kwargs by excluding 'query' if it's already explicitly passed
-                kwargs_params = {k: v for k, v in task_params.items() if k != 'query'}
-                self.logger.debug(f"Calling self.llm_service.retrieve(query='{query}', **{kwargs_params})")
-
-                try:
-                    response_data = await self.llm_service.retrieve(query=query, **kwargs_params)
-                    self.logger.info(f"LLMRetriever call successful. Response data type: {type(response_data)}")
-                    self.logger.debug(f"LLMRetriever response data: {response_data}")
+                if self.llm_service and hasattr(self.llm_service, 'retrieve'):
+                    self.logger.debug(f"Calling self.llm_service.retrieve with {task_params}")
+                    # Actual call to service; response_data would be its result
+                    response_data = await self.llm_service.retrieve(task_params)
+                    # Mocking service call for now
+                    # mock_data = f"Retrieved data for query: '{task_params.get('query', 'N/A')}'"
                     return TaskResult(status="success", data=response_data, message="LLMRetriever processed successfully.")
-                except Exception as service_exc:
-                    self.logger.error(f"Exception during LLMRetriever service call: {service_exc}", exc_info=True)
-                    error_details_payload["exception_type"] = type(service_exc).__name__
-                    error_details_payload["exception_message"] = str(service_exc)
-                    return TaskResult(status="error", message=f"Error during LLMRetriever execution: {service_exc}", error_details=error_details_payload)
+                else:
+                    self.logger.warn(f"LLMRetriever (self.llm_service or retrieve method) not available. Task params: {task_params}")
+                    return TaskResult(status="error", message="LLMRetriever service not available.", error_details=task_params)
 
             elif target_module == "LLMListener":
-                if not self.llm_service:
-                    self.logger.error("LLMService (self.llm_service) is not available for LLMListener.")
-                    error_details_payload["reason"] = "LLMService not configured."
-                    return TaskResult(status="error", message="LLMListener service not configured.", error_details=error_details_payload)
-                if not hasattr(self.llm_service, 'process'):
-                    self.logger.error("LLMService does not have a 'process' method for LLMListener.")
-                    error_details_payload["reason"] = "LLMService 'process' method missing."
-                    return TaskResult(status="error", message="LLMListener service method 'process' not found.", error_details=error_details_payload)
-
-                raw_data = task_params.get('raw_data')
-                context_instructions = task_params.get('context_instructions')
-                # raw_data could be None if only context_instructions are provided for certain operations
-
-                # Prepare kwargs by excluding 'raw_data' and 'context_instructions'
-                kwargs_params = {k: v for k, v in task_params.items() if k not in ['raw_data', 'context_instructions']}
-                self.logger.debug(f"Calling self.llm_service.process(data='{raw_data}', context_instructions={context_instructions}, **{kwargs_params})")
-
-                try:
-                    response_data = await self.llm_service.process(data=raw_data, context_instructions=context_instructions, **kwargs_params)
-                    self.logger.info(f"LLMListener call successful. Response data type: {type(response_data)}")
-                    self.logger.debug(f"LLMListener response data: {response_data}")
+                if self.llm_service and hasattr(self.llm_service, 'process'):
+                    self.logger.debug(f"Calling self.llm_service.process with {task_params}")
+                    response_data = await self.llm_service.process(task_params)
+                    # mock_data = f"Processed data: '{task_params.get('data', 'N/A')}'"
                     return TaskResult(status="success", data=response_data, message="LLMListener processed successfully.")
-                except Exception as service_exc:
-                    self.logger.error(f"Exception during LLMListener service call: {service_exc}", exc_info=True)
-                    error_details_payload["exception_type"] = type(service_exc).__name__
-                    error_details_payload["exception_message"] = str(service_exc)
-                    return TaskResult(status="error", message=f"Error during LLMListener execution: {service_exc}", error_details=error_details_payload)
+                else:
+                    self.logger.warn(f"LLMListener (self.llm_service or process method) not available. Task params: {task_params}")
+                    return TaskResult(status="error", message="LLMListener service not available.", error_details=task_params)
 
             elif target_module == "ErrorHandler":
-                self.logger.info(f"Handling error with ErrorHandler. Error details: {task_params}")
-                # task_params itself becomes the error_details for ErrorHandler
-                return TaskResult(status="error",
-                                  message=task_params.get("error_message", "Error handled by ErrorHandler."),
-                                  error_details=task_params)
+                self.logger.info(f"Handling error with ErrorHandler. Parameters: {task_params}")
+                # task_params here usually contains error_message and original_intent_info or details
+                return TaskResult(status="error", message=task_params.get("error_message", "Error handled by ErrorHandler."),
+                                  error_details=task_params) # task_params itself becomes the error_details
 
             else: # Unknown module
-                self.logger.warn(f"Unknown module for dispatch: '{target_module}'. Parameters: {task_params}")
-                error_details_payload["reason"] = f"Unknown target module: {target_module}"
-                return TaskResult(status="error", message=f"Unknown module: {target_module}", error_details=error_details_payload)
+                self.logger.warn(f"Unknown module for dispatch: {target_module}. Parameters: {task_params}")
+                return TaskResult(status="error", message=f"Unknown module: {target_module}", error_details=task_params)
 
-        except Exception as e: # Catch-all for unexpected errors within dispatch_task itself
-            self.logger.error(f"Critical unhandled exception in dispatch_task for module '{target_module}': {e}", exc_info=True)
-            error_details_payload["exception_type"] = type(e).__name__
-            error_details_payload["exception_message"] = str(e)
-            error_details_payload["reason"] = "Critical unhandled error in dispatch logic."
+        except Exception as e:
+            self.logger.error(f"Exception during dispatch to '{target_module}' with params='{task_params}': {e}", exc_info=True)
             return TaskResult(
                 status="error",
-                message=f"Critical error dispatching to {target_module}: {str(e)}",
-                error_details=error_details_payload
+                message=f"Exception during dispatch to {target_module}: {str(e)}",
+                error_details={"target_module": target_module, "task_parameters": task_params, "exception": str(e)}
             )
+
 
     async def handle_request(self, raw_input: any, conversation_id: str = None, current_context: dict = None) -> TaskResult:
         """
@@ -567,7 +395,7 @@ class ContextAgent:
             if current_context:
                 self.logger.debug("Context available, could be used to refine intent detection.")
             intent_extraction_result = await self.detect_intent(processed_input)
-            self.logger.info(f"Step 2/5: Detected intent: {intent_extraction_result.intent}, Entities: {intent_extraction_result.entities}, Confidence: {intent_extraction_result.confidence}, Matched Patterns: {len(intent_extraction_result.matched_patterns)}")
+            self.logger.info(f"Step 2/5: Detected intent: {intent_extraction_result.dict()}") # Log Pydantic model as dict
             if intent_extraction_result.intent == "intent_detection_error":
                  self.logger.warn(f"Intent detection failed. Details: {intent_extraction_result.entities.get('error_message')}")
                  # Routing to ErrorHandler will happen in decide_route based on this intent_extraction_result
