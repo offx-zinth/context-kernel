@@ -69,6 +69,8 @@
 #   - Type Hinted: Use Python type hints for clarity and to aid static analysis.
 
 import uuid
+import re # For sanitize_text
+from datetime import datetime, timezone # For UTC timestamp
 from typing import List, TypeVar, Any, Generator
 
 # Generic type variable for the chunk_list function
@@ -80,13 +82,13 @@ def generate_unique_id(prefix: str = "id") -> str:
 
     Args:
         prefix: An optional string prefix for the generated ID.
-                Defaults to "id".
+                Defaults to "id". If an empty string is provided, no prefix is used.
 
     Returns:
-        A string representing the unique ID (e.g., "prefix_uuid_string").
+        A string representing the unique ID (e.g., "prefix_uuid_string" or just "uuid_string").
     """
     unique_val = uuid.uuid4()
-    if prefix:
+    if prefix: # Handles empty string prefix correctly (no "_" added)
         return f"{prefix}_{unique_val}"
     return str(unique_val)
 
@@ -110,11 +112,52 @@ def chunk_list(data: List[T], chunk_size: int) -> Generator[List[T], None, None]
     if not isinstance(chunk_size, int) or chunk_size <= 0:
         raise ValueError("chunk_size must be a positive integer.")
 
-    if not data:
-        return # Yield nothing for an empty list
+    if not data: # Handle empty list explicitly
+        return # Yield nothing
 
     for i in range(0, len(data), chunk_size):
         yield data[i:i + chunk_size]
+
+def get_current_utc_timestamp() -> str:
+    """
+    Gets the current UTC timestamp in ISO 8601 format.
+
+    Example: "2023-10-27T10:30:00.123456Z"
+
+    Returns:
+        A string representing the current UTC timestamp in ISO 8601 format,
+        ending with 'Z' to denote UTC.
+    """
+    # datetime.now(timezone.utc) is recommended for timezone-aware current time
+    # .isoformat() by default includes microseconds.
+    # Replace '+00:00' with 'Z' for common ISO 8601 UTC representation.
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+def sanitize_text(text: str, collapse_whitespace: bool = True) -> str:
+    """
+    Performs basic text sanitization:
+    - Removes leading and trailing whitespace.
+    - Optionally collapses multiple consecutive whitespace characters into a single space.
+
+    Args:
+        text: The input string to sanitize.
+        collapse_whitespace: If True (default), multiple whitespace characters
+                             (spaces, tabs, newlines) are collapsed into a single space.
+
+    Returns:
+        The sanitized string.
+    """
+    if not isinstance(text, str):
+        # Or raise TypeError, depending on desired strictness
+        return str(text)
+
+    sanitized = text.strip() # Remove leading/trailing whitespace
+
+    if collapse_whitespace:
+        # Replace any sequence of one or more whitespace characters with a single space
+        sanitized = re.sub(r'\s+', ' ', sanitized)
+
+    return sanitized
 
 
 if __name__ == "__main__":
@@ -127,10 +170,10 @@ if __name__ == "__main__":
     id3 = generate_unique_id("") # Test with empty prefix
     print(f"  Default prefix: {id1}")
     print(f"  'user' prefix: {id2}")
-    print(f"  Empty prefix: {id3}")
+    print(f"  Empty prefix (no underscore expected): {id3}")
     assert "id_" in id1
     assert "user_" in id2
-    assert "_" not in id3 # uuid4 string itself does not contain underscores typically
+    assert "_" not in id3 # uuid.uuid4() string itself does not contain underscores
     assert len(id1) > 36 # prefix + _ + uuid
     assert len(id2) > 36
     assert len(id3) == 36 # length of uuid4 string
@@ -182,10 +225,55 @@ if __name__ == "__main__":
     try:
         list(chunk_list([1, 2, 3], 1.5)) # type: ignore
     except ValueError as e:
-        print(f"    Caught expected error for chunk_size=1.5: {e}")
+        print(f"    Caught expected error for chunk_size=1.5: {e}") # Will be caught by isinstance check
         assert "positive integer" in str(e)
+
+    # Demonstrate get_current_utc_timestamp
+    print("\n3. get_current_utc_timestamp():")
+    ts = get_current_utc_timestamp()
+    print(f"  Current UTC Timestamp: {ts}")
+    assert ts.endswith("Z")
+    assert "T" in ts
+    assert len(ts) >= 20 # e.g., "YYYY-MM-DDTHH:MM:SSZ" (minimal if no microseconds)
+
+    # Demonstrate sanitize_text
+    print("\n4. sanitize_text():")
+    text1 = "  hello world  "
+    text2 = "hello \t world \n with \r multiple   spaces"
+    text3 = "already clean"
+    text4 = ""
+    text5 = "  "
+    text6 = 123 # type: ignore # Test with non-string input
+
+    print(f"  Original: '{text1}' -> Sanitized: '{sanitize_text(text1)}'")
+    assert sanitize_text(text1) == "hello world"
+
+    print(f"  Original: '{text2}' -> Sanitized: '{sanitize_text(text2)}'")
+    assert sanitize_text(text2) == "hello world with multiple spaces"
+
+    print(f"  Original: '{text2}' (no collapse) -> Sanitized: '{sanitize_text(text2, collapse_whitespace=False)}'")
+    # \s+ would collapse \t and \n to a single space if not for the strip() first.
+    # The regex `\s+` matches one or more whitespace chars. `strip()` removes leading/trailing.
+    # If collapse_whitespace is False, only strip() is applied.
+    expected_no_collapse = "hello \t world \n with \r multiple   spaces" # Only leading/trailing removed
+    assert sanitize_text(text2, collapse_whitespace=False) == expected_no_collapse.strip()
+
+
+    print(f"  Original: '{text3}' -> Sanitized: '{sanitize_text(text3)}'")
+    assert sanitize_text(text3) == "already clean"
+
+    print(f"  Original: '{text4}' -> Sanitized: '{sanitize_text(text4)}'")
+    assert sanitize_text(text4) == ""
+
+    print(f"  Original: '{text5}' -> Sanitized: '{sanitize_text(text5)}'")
+    assert sanitize_text(text5) == ""
+
+    print(f"  Original (non-string): {text6} -> Sanitized: '{sanitize_text(text6)}'") # type: ignore
+    assert sanitize_text(text6) == "123" # type: ignore
 
     print("\n--- All demonstrations complete ---")
 
 # End of helpers.py
 # Ensure this replaces the old "helpers.py loaded" print and comments.
+
+[end of contextkernel/utils/helpers.py]

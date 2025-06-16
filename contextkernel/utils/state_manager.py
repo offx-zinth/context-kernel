@@ -22,6 +22,9 @@ try:
 except ImportError:
     aioredis = None # type: ignore
 
+# ContextKernel imports
+from contextkernel.core_logic.exceptions import MemoryAccessError, ConfigurationError
+
 logger = logging.getLogger(__name__)
 
 class AbstractStateManager(ABC):
@@ -61,6 +64,17 @@ class AbstractStateManager(ABC):
         """
         pass
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+
+    @abstractmethod
+    async def close(self):
+        """Closes any underlying connections or resources."""
+        pass
+
 
 class InMemoryStateManager(AbstractStateManager):
     """Manages state in an in-memory dictionary."""
@@ -82,81 +96,101 @@ class InMemoryStateManager(AbstractStateManager):
         if session_id in self._store:
             del self._store[session_id]
 
+    async def close(self):
+        logger.info("InMemoryStateManager closed (no-op).")
+        pass
+
 
 class RedisStateManager(AbstractStateManager):
     """Manages state using a Redis backend."""
 
     def __init__(self, host: str = "localhost", port: int = 6379, db: int = 0, password: Optional[str] = None):
         if aioredis is None:
-            msg = "aioredis library not found. Please install with `pip install aioredis redis`."
+            msg = "aioredis library not found. Please install with `pip install aioredis`."
             logger.error(msg)
-            raise ImportError(msg)
+            # Raising ConfigurationError as aioredis is a required dependency for this state manager
+            raise ConfigurationError(msg)
 
-        self.redis_url = f"redis://{host}:{port}"
-        # Include password in URL if provided
+        # Construct Redis URL, including password if provided
         if password:
             self.redis_url = f"redis://:{password}@{host}:{port}/{db}"
         else:
             self.redis_url = f"redis://{host}:{port}/{db}"
 
         try:
-            # `from_url` is the correct way for aioredis v2+
+            # `from_url` is the standard way to create a Redis client/pool in aioredis v2+
             self.redis = aioredis.from_url(self.redis_url)
-            logger.info(f"RedisStateManager initialized with URL: redis://{host}:{port}/{db}")
-        except Exception as e:
-            logger.error(f"Failed to initialize Redis client with URL {self.redis_url}: {e}", exc_info=True)
-            # Fallback or raise, depending on desired behavior. Here we'll let it raise implicitly
-            # if self.redis is not set, or handle it more gracefully.
-            # For now, if connection fails here, subsequent calls will fail.
-            self.redis = None # type: ignore
-
+            logger.info(f"RedisStateManager initialized, connected to redis://{host}:{port}/{db}")
+        except aioredis.RedisError as e: # More specific exception for Redis connection issues
+            logger.error(f"Failed to initialize Redis client with URL redis://{host}:{port}/{db}: {e}", exc_info=True)
+            raise ConfigurationError(f"Redis connection failed at {host}:{port}: {e}") from e
+        except Exception as e: # Catch any other unexpected errors during initialization
+            logger.error(f"An unexpected error occurred during Redis client initialization: {e}", exc_info=True)
+            raise ConfigurationError(f"Unexpected error initializing Redis client: {e}") from e
 
     async def get_state(self, session_id: str) -> Optional[Dict[str, Any]]:
-        if not self.redis:
-            logger.error("Redis client not initialized. Cannot get state.")
-            return None
+        if not self.redis: # Should ideally not be hit if __init__ raises ConfigurationError
+            logger.error("Redis client not available. Cannot get state.")
+            raise ConfigurationError("Redis client not initialized.")
         try:
             logger.debug(f"RedisStateManager: Getting state for session_id: {session_id}")
             raw_state = await self.redis.get(session_id)
             if raw_state:
-                return json.loads(raw_state.decode('utf-8')) # type: ignore
+                return json.loads(raw_state.decode('utf-8'))
             return None
-        except Exception as e:
-            logger.error(f"RedisStateManager: Error getting state for session_id {session_id}: {e}", exc_info=True)
-            raise MemoryAccessError(f"Redis GET failed for session {session_id}") from e
+        except aioredis.RedisError as e:
+            logger.error(f"RedisStateManager: Redis error getting state for session_id {session_id}: {e}", exc_info=True)
+            raise MemoryAccessError(f"Redis GET operation failed for session {session_id}") from e
+        except json.JSONDecodeError as e:
+            logger.error(f"RedisStateManager: Error decoding JSON state for session_id {session_id}: {e}", exc_info=True)
+            raise MemoryAccessError(f"Failed to decode state for session {session_id}") from e
 
     async def save_state(self, session_id: str, state: Dict[str, Any]) -> None:
-        if not self.redis:
-            logger.error("Redis client not initialized. Cannot save state.")
-            # Optionally raise ConfigurationError here if Redis connection is absolutely necessary
-            return
+        if not self.redis: # Should ideally not be hit
+            logger.error("Redis client not available. Cannot save state.")
+            raise ConfigurationError("Redis client not initialized.")
         try:
-            logger.debug(f"RedisStateManager: Saving state for session_id: {session_id}, State: {state}")
+            logger.debug(f"RedisStateManager: Saving state for session_id: {session_id}") # State not logged to avoid large log entries
             await self.redis.set(session_id, json.dumps(state))
-        except Exception as e:
-            logger.error(f"RedisStateManager: Error saving state for session_id {session_id}: {e}", exc_info=True)
-            raise MemoryAccessError(f"Redis SET failed for session {session_id}") from e
+        except aioredis.RedisError as e:
+            logger.error(f"RedisStateManager: Redis error saving state for session_id {session_id}: {e}", exc_info=True)
+            raise MemoryAccessError(f"Redis SET operation failed for session {session_id}") from e
 
     async def delete_state(self, session_id: str) -> None:
-        if not self.redis:
-            logger.error("Redis client not initialized. Cannot delete state.")
-            return
+        if not self.redis: # Should ideally not be hit
+            logger.error("Redis client not available. Cannot delete state.")
+            raise ConfigurationError("Redis client not initialized.")
         try:
             logger.debug(f"RedisStateManager: Deleting state for session_id: {session_id}")
             await self.redis.delete(session_id)
-        except Exception as e:
-            logger.error(f"RedisStateManager: Error deleting state for session_id {session_id}: {e}", exc_info=True)
-            raise MemoryAccessError(f"Redis DELETE failed for session {session_id}") from e
+        except aioredis.RedisError as e:
+            logger.error(f"RedisStateManager: Redis error deleting state for session_id {session_id}: {e}", exc_info=True)
+            raise MemoryAccessError(f"Redis DELETE operation failed for session {session_id}") from e
 
     async def close(self):
-        """Closes the Redis connection."""
+        """Closes the Redis connection pool."""
         if self.redis:
             try:
                 await self.redis.close()
-                # For aioredis v2, `close()` should be followed by `wait_closed()` if managed explicitly.
-                # However, typically `aioredis.from_url` creates a connection pool that manages connections.
-                # Explicit closing might be needed on application shutdown.
-                # await self.redis.wait_closed() # This might be needed for older aioredis or specific use cases
-                logger.info("Redis connection closed.")
+                # In aioredis, `close()` starts the closing process for the pool.
+                # `wait_closed()` could be used if we needed to ensure full closure before proceeding,
+                # but often it's managed by the library or not strictly necessary for basic cleanup.
+                logger.info("Redis connection pool closed.")
+            except aioredis.RedisError as e: # Catch potential errors during close
+                logger.error(f"Error closing Redis connection pool: {e}", exc_info=True)
             except Exception as e:
-                logger.error(f"Error closing Redis connection: {e}", exc_info=True)
+                 logger.error(f"Unexpected error closing Redis connection pool: {e}", exc_info=True)
+        self.redis = None # type: ignore
+
+    # Implementing __aenter__ and __aexit__ for asynchronous context management
+    async def __aenter__(self):
+        # Connection is established in __init__. If it failed, an error would have been raised.
+        # So, if we reach here, self.redis should be valid.
+        logger.debug("RedisStateManager entered context.")
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        logger.debug("RedisStateManager exiting context, closing connection.")
+        await self.close()
+
+[end of contextkernel/utils/state_manager.py]
