@@ -24,13 +24,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict # Ensure Settings
 try:
     from transformers import pipeline, Pipeline
 except ImportError:
-    pipeline = None
-    Pipeline = None # type: ignore
+    pipeline = None 
+    Pipeline = None # type: ignore 
 
 from contextkernel.core_logic.summarizer import Summarizer, SummarizerConfig
 from contextkernel.core_logic.llm_retriever import HuggingFaceEmbeddingModel
 from .exceptions import (
-    ConfigurationError, ExternalServiceError, EmbeddingError,
+    ConfigurationError, ExternalServiceError, EmbeddingError, 
     MemoryAccessError, SummarizationError, PipelineError, CoreLogicError
 )
 
@@ -94,7 +94,7 @@ class StructuredInsight(TimestampedModel):
 class LLMListener:
     def __init__(self, listener_config: LLMListenerConfig, memory_systems: Dict[str, BaseMemorySystem],
                  data_processing_config: Optional[Dict[str, Any]] = None, llm_client: Optional[Any] = None):
-        self.logger = logger
+        self.logger = logger 
         self.listener_config = listener_config
         self.memory_systems = memory_systems
         self.data_processing_config = data_processing_config or {}
@@ -104,7 +104,7 @@ class LLMListener:
             self.summarizer = Summarizer(self.listener_config.summarizer_config)
         except ConfigurationError as e:
             self.logger.error(f"CRITICAL: Summarizer config failed: {e}", exc_info=True); raise
-
+        
         if not self.listener_config.embedding_model_name:
             raise ConfigurationError("embedding_model_name is required for LLMListener.")
         try:
@@ -114,7 +114,7 @@ class LLMListener:
 
         self.ner_pipeline, self.re_pipeline, self.re_llm_pipeline = None, None, None
         if pipeline is None:
-            if any(getattr(self.listener_config, m, None) for m in
+            if any(getattr(self.listener_config, m, None) for m in 
                    ['entity_extraction_model_name', 'relation_extraction_model_name', 'general_llm_for_re_model_name']):
                 raise ConfigurationError("Transformers 'pipeline' unavailable but NER/RE models configured.")
             self.logger.warning("Transformers 'pipeline' unavailable; NER/RE disabled.")
@@ -209,7 +209,7 @@ class LLMListener:
         if "graph_db" in self.memory_systems:
             if structured_data.entities: ops.append(self.memory_systems["graph_db"].add_entities(entities=structured_data.entities, document_id=doc_id_base, metadata={"raw_data_id": structured_data.raw_data_id}))
             if structured_data.relations: ops.append(self.memory_systems["graph_db"].add_relations(relations=structured_data.relations, document_id=doc_id_base, metadata={"raw_data_id": structured_data.raw_data_id}))
-
+        
         results = await asyncio.gather(*ops, return_exceptions=True)
         for i, res in enumerate(results):
             if isinstance(res, Exception): self.logger.error(f"Memory op {i} failed: {res}", exc_info=res); raise MemoryAccessError(f"Memory operation failed: {res}") from res

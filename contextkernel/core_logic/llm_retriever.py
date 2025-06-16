@@ -118,7 +118,7 @@ class StubLTM:
 
         if np is None: raise ConfigurationError("Numpy not installed for StubLTM.")
         if faiss is None: self.logger.warning("FAISS library not installed; FAISS features disabled in StubLTM.")
-
+        
         if self.faiss_index_path and os.path.exists(self.faiss_index_path) and faiss:
             try:
                 self.index = faiss.read_index(self.faiss_index_path)
@@ -134,7 +134,7 @@ class StubLTM:
         if faiss and self.index is None and embedding:
             try: self.index = faiss.IndexIDMap2(faiss.IndexFlatL2(np.array(embedding).shape[-1]))
             except Exception as e: raise MemoryAccessError(f"FAISS index creation failed: {e}") from e
-
+        
         if faiss and self.index and embedding:
             try:
                 np_embedding = np.array(embedding, dtype=np.float32).reshape(1, -1)
@@ -250,7 +250,7 @@ class LLMRetriever:
                 if not os.path.exists(idx_dir): os.makedirs(idx_dir)
                 self.whoosh_ix = open_dir(idx_dir) if exists_in(idx_dir) else create_in(idx_dir, schema)
             except Exception as e: raise ConfigurationError(f"Whoosh index init failed at '{idx_dir}': {e}") from e
-
+        
         if hasattr(self.ltm, 'whoosh_ix'): self.ltm.whoosh_ix = self.whoosh_ix
         if hasattr(self.ltm, 'retriever_config'): self.ltm.retriever_config = self.retriever_config
 
@@ -269,7 +269,7 @@ class LLMRetriever:
         if not hasattr(self.ltm, 'search'): raise ConfigurationError("LTM interface missing 'search'.")
         try: return await self.ltm.search(query_embedding=q_embed, top_k=top_k, filters=filters)
         except Exception as e: raise MemoryAccessError(f"LTM search error: {e}") from e
-
+        
     async def _search_graph_db(self, query: str, task: Optional[str]=None, top_k: int=5, filters: Optional[Dict]=None) -> List[RetrievedItem]:
         if not hasattr(self.graph_db, 'search'): raise ConfigurationError("GraphDB interface missing 'search'.")
         try: return await self.graph_db.search(query=query, task_description=task, top_k=top_k, filters=filters)
@@ -291,7 +291,7 @@ class LLMRetriever:
             key = str(item.metadata.get("doc_id") or str(item.content)[:50])
             if key not in unique_results or (item.score and (unique_results[key].score is None or item.score > unique_results[key].score)): # type: ignore
                 unique_results[key] = item
-
+        
         sorted_results = sorted(unique_results.values(), key=lambda x: x.score or 0.0, reverse=True)
 
         if self.cross_encoder and sorted_results:
@@ -307,10 +307,10 @@ class LLMRetriever:
     async def retrieve(self, query: str, task_description: Optional[str]=None, top_k: Optional[int]=None, filters: Optional[Dict]=None, retrieval_strategy: str="all") -> RetrievalResponse:
         start_time, current_top_k = time.time(), top_k or self.retriever_config.default_top_k
         final_items, errors = [], []
-
+        
         try: q_embed = await self._preprocess_and_embed_query(query, task_description) if self.embedding_model else []
         except EmbeddingError as e: q_embed, errors = [], [f"Query embedding failed: {e}"]
-
+        
         task_error_messages: List[str] = [] # Initialize task_error_messages, was missing in original snippet for retrieve
 
         search_coros = []
@@ -321,22 +321,22 @@ class LLMRetriever:
         if search_coros:
             results_from_sources = await asyncio.gather(*search_coros, return_exceptions=True)
             processed_results: List[List[RetrievedItem]] = []
-            # Combine errors from asyncio.gather (e.g. direct call failures)
+            # Combine errors from asyncio.gather (e.g. direct call failures) 
             # with task_error_messages (e.g. soft errors within search methods if they didn't raise)
             all_errors = errors # Start with embedding errors
             for i, res_or_exc in enumerate(results_from_sources):
-                if isinstance(res_or_exc, Exception):
+                if isinstance(res_or_exc, Exception): 
                     all_errors.append(f"Search source {i} failed: {res_or_exc}")
-                elif res_or_exc:
+                elif res_or_exc: 
                     processed_results.append(res_or_exc) # type: ignore
-
+            
             # Add any task_error_messages that might have been populated by individual search methods
             # (though current search methods raise on error, this is for robustness if they change)
             all_errors.extend(task_error_messages)
 
-            if processed_results:
+            if processed_results: 
                 final_items = await self._consolidate_and_rank_results(query, processed_results)
-
+        
         msg = f"Retrieved {len(final_items)} items." + (f" Errors: {'; '.join(all_errors)}" if all_errors else "")
         return RetrievalResponse(items=final_items, retrieval_time_ms=(time.time()-start_time)*1000, message=msg)
 

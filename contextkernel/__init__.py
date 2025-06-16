@@ -8,7 +8,7 @@ and exposing these capabilities via APIs and SDKs.
 
 __version__ = "0.1.0"
 
-from .utils import get_settings
+# from .utils import get_settings # Commented out due to ImportError
 from .interfaces import ContextKernelClient, app as api_app
 
 # Core components would be imported here as they are developed, e.g.:
@@ -16,7 +16,7 @@ from .interfaces import ContextKernelClient, app as api_app
 
 __all__ = [
     "__version__",
-    "get_settings",
+    # "get_settings",
     "ContextKernelClient",
     "api_app", # The FastAPI application instance, aliased
     # "ContextAgent", # When available

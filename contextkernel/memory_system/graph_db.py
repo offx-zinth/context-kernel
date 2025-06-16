@@ -70,45 +70,42 @@ class GraphDB:
         """
         parameters = parameters or {}
         db_name = self.config.database # Use database from config if specified
-
         records_list: List[Dict[str, Any]] = []
 
-        try:
-            async with self.driver.session(database=db_name) as session:
-                if write:
-                    # For write transactions
-                    async def tx_logic(tx, q, params):
-                        results = await tx.run(q, params)
-                        # Consume results before commit if it's a write that returns data (e.g. MERGE ... RETURN)
-                        # For simple writes (CREATE, DELETE without RETURN), records might be empty or summary.
-                        # Neo4jResult.data() converts records to list of dicts
-                        return [record.data() async for record in results]
+        max_retries = 2
+        delay_seconds = 1
 
-                    records_list = await session.execute_write(tx_logic, query, parameters)
-                    logger.debug(f"Executed WRITE query. Cypher: '{query}', Params: {parameters}. Returned {len(records_list)} records.")
-                else:
-                    # For read transactions
-                    async def tx_logic(tx, q, params):
-                        results = await tx.run(q, params)
-                        return [record.data() async for record in results] # Convert Neo4j Records to dicts
-
-                    records_list = await session.execute_read(tx_logic, query, parameters)
-                    logger.debug(f"Executed READ query. Cypher: '{query}', Params: {parameters}. Returned {len(records_list)} records.")
-
-        except neo4j_exceptions.ServiceUnavailable as e:
-            logger.error(f"Neo4j service unavailable. Query: '{query}'. Error: {e}")
-            # Optionally raise a custom exception or handle retry logic here
-            return []
-        except neo4j_exceptions.CypherSyntaxError as e:
-            logger.error(f"Cypher syntax error. Query: '{query}'. Error: {e}")
-            return []
-        except neo4j_exceptions.ResultNotCustomizableError as e: # Raised when trying to access raw data from a summary
-            logger.warning(f"Query did not return customizable results (e.g., summary for write op). Query: '{query}'. Error: {e}")
-            # This might not be an error for write ops that don't return data, return empty list.
-            return []
-        except Exception as e: # Catch any other Neo4jError or general exceptions
-            logger.error(f"An unexpected error occurred with Neo4j query: '{query}'. Error: {type(e).__name__} - {e}")
-            return []
+        for attempt_num in range(max_retries + 1):
+            try:
+                async with self.driver.session(database=db_name) as session:
+                    if write:
+                        async def tx_logic(tx, q, params):
+                            results = await tx.run(q, params)
+                            return [record.data() async for record in results]
+                        records_list = await session.execute_write(tx_logic, query, parameters)
+                        logger.debug(f"Executed WRITE query. Cypher: '{query}', Params: {parameters}. Returned {len(records_list)} records.")
+                    else:
+                        async def tx_logic(tx, q, params):
+                            results = await tx.run(q, params)
+                            return [record.data() async for record in results]
+                        records_list = await session.execute_read(tx_logic, query, parameters)
+                        logger.debug(f"Executed READ query. Cypher: '{query}', Params: {parameters}. Returned {len(records_list)} records.")
+                break # Success, exit retry loop
+            except neo4j_exceptions.ServiceUnavailable as e:
+                logger.warning(f"Neo4j service unavailable. Query: '{query}'. Attempt {attempt_num + 1}/{max_retries + 1}. Error: {e}")
+                if attempt_num >= max_retries:
+                    logger.error(f"Max retries reached for query: '{query}'. Re-raising exception.")
+                    raise
+                await asyncio.sleep(delay_seconds)
+            except neo4j_exceptions.CypherSyntaxError as e:
+                logger.error(f"Cypher syntax error. Query: '{query}'. Error: {e}")
+                return [] # Do not retry for syntax errors
+            except neo4j_exceptions.ResultNotCustomizableError as e: # Raised when trying to access raw data from a summary
+                logger.warning(f"Query did not return customizable results (e.g., summary for write op). Query: '{query}'. Error: {e}")
+                return []
+            except Exception as e: # Catch any other Neo4jError or general exceptions
+                logger.error(f"An unexpected error occurred with Neo4j query: '{query}'. Error: {type(e).__name__} - {e}")
+                return [] # Do not retry for other unexpected errors
 
         return records_list
 
@@ -303,7 +300,8 @@ class GraphDB:
 
     async def vector_search(self, embedding: List[float], top_k: int = 5, index_name: str = "node_embedding_index", node_label: Optional[str] = None, embedding_property: str = "embedding") -> List[Dict[str, Any]]:
         # This query assumes a Neo4j 5.x vector index.
-        # Example: CREATE VECTOR INDEX node_embedding_index FOR (n:YourLabel) ON (n.embedding)
+        logger.info(f"Attempting vector search on index '{index_name}'. Ensure this index exists and is populated for optimal performance.")
+        logger.info(f"Example Cypher for index creation: CREATE VECTOR INDEX {index_name} FOR (n:{node_label or 'YourNodeLabel'}) ON (n.{embedding_property}) OPTIONS {{indexConfig: {{ `vector.dimensions`: {len(embedding)}, `vector.similarity_function`: 'cosine' }} }}")
         logger.info(f"Performing vector search in index '{index_name}' with top_k={top_k} for embedding (first 3 dims): {embedding[:3]}...")
 
         # The exact query might depend on the specific index setup and Neo4j version.
@@ -327,15 +325,18 @@ class GraphDB:
         # Process results: Neo4j nodes need to be converted to dicts.
         # The 'node' in results from queryNodes is already the node object.
         processed_results = []
-        if results:
+        if results: # results is already a list of dicts from _execute_query_neo4j
             for record in results:
-                node_data = record.get("node")
+                node_data_raw = record.get("node") # This is a dict if returned by _execute_query_neo4j
                 score = record.get("score")
-                if node_data:
-                    processed_results.append({"node_id": node_data.get("node_id"), "data": dict(node_data), "score": score})
+                if node_data_raw and isinstance(node_data_raw, dict): # Ensure it's a dict
+                    processed_results.append({"node_id": node_data_raw.get("node_id"), "data": node_data_raw, "score": score})
+                elif node_data_raw: # If it's not a dict but some other Neo4j object representation (shouldn't happen with current _execute_query_neo4j)
+                    logger.warning(f"Vector search record.node was not a dict: {type(node_data_raw)}. Full record: {record}")
 
-        logger.info(f"Vector search returned {len(processed_results)} results.")
-        return results
+
+        logger.info(f"Vector search returned {len(processed_results)} results from index '{index_name}'.")
+        return processed_results # Return the processed list
 
 async def main():
     # Ensure basicConfig is called for the logger to output messages.

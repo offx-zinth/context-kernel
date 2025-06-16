@@ -13,36 +13,36 @@
 # limitations under the License.
 
 import logging
-from typing import Dict, Any, List, Optional as TypingOptional
+from typing import Dict, Any, List, Optional as TypingOptional 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings # For Config model
 import spacy
-import datetime
+import datetime 
 from spacy.matcher import Matcher
 
 from ..utils.state_manager import InMemoryStateManager, RedisStateManager, AbstractStateManager
 from .exceptions import (
-    ConfigurationError, IntentDetectionError, ExternalServiceError,
+    ConfigurationError, IntentDetectionError, ExternalServiceError, 
     CoreLogicError, MemoryAccessError, SummarizationError, EmbeddingError, PipelineError
 )
 
 try:
     from transformers import pipeline, Pipeline
 except ImportError:
-    pipeline = None
-    Pipeline = None # type: ignore
+    pipeline = None 
+    Pipeline = None # type: ignore 
 
 
 # Configuration Model
 class ContextAgentConfig(BaseSettings):
     spacy_model_name: str = "en_core_web_sm"
     low_confidence_threshold: float = 0.6
-    default_intent_confidence: float = 0.5
-    high_confidence_threshold: float = 0.8
+    default_intent_confidence: float = 0.5 
+    high_confidence_threshold: float = 0.8 
     intent_candidate_labels: List[str] = Field(default_factory=lambda: ["search information", "save information", "summarize text", "general question"])
     intent_classifier_model: str = "facebook/bart-large-mnli"
     use_spacy_matcher_first: bool = True
-    state_manager_type: str = "in_memory"
+    state_manager_type: str = "in_memory" 
     redis_host: str = "localhost"
     redis_port: int = 6379
 
@@ -54,7 +54,7 @@ class IntentExtractionResult(BaseModel):
     entities: Dict[str, Any] = Field(default_factory=dict)
     confidence: TypingOptional[float] = None
     original_input: TypingOptional[str] = None
-    spacy_doc: Any = None
+    spacy_doc: Any = None 
     matched_patterns: List[Dict[str, Any]] = Field(default_factory=list)
     class Config: arbitrary_types_allowed = True
 
@@ -64,7 +64,7 @@ class RoutingDecision(BaseModel):
     original_intent: TypingOptional[IntentExtractionResult] = None
 
 class TaskResult(BaseModel):
-    status: str
+    status: str 
     data: TypingOptional[Any] = None
     message: TypingOptional[str] = None
     error_details: TypingOptional[Dict[str, Any]] = None
@@ -73,9 +73,9 @@ class TaskResult(BaseModel):
 class ContextAgent:
     def __init__(self, llm_service: Any, memory_system: Any, agent_config: ContextAgentConfig, state_manager: TypingOptional[AbstractStateManager] = None):
         self.logger = logging.getLogger(__name__)
-        self.agent_config = agent_config
-        self.llm_service = llm_service
-        self.memory_system = memory_system
+        self.agent_config = agent_config 
+        self.llm_service = llm_service 
+        self.memory_system = memory_system 
         self.intent_classifier: Optional[Pipeline] = None
         self.nlp: Optional[spacy.Language] = None
         self.matcher: Optional[Matcher] = None
@@ -91,9 +91,9 @@ class ContextAgent:
                 self.logger.info(f"spaCy model '{self.agent_config.spacy_model_name}' initialized.")
             except OSError as e:
                 self.logger.error(f"spaCy model '{self.agent_config.spacy_model_name}' not found or invalid: {e}", exc_info=True)
-                if self.agent_config.use_spacy_matcher_first:
+                if self.agent_config.use_spacy_matcher_first: 
                     raise ConfigurationError(f"Required spaCy model '{self.agent_config.spacy_model_name}' failed to load.") from e
-            except Exception as e:
+            except Exception as e: 
                 self.logger.error(f"Unexpected error loading spaCy model '{self.agent_config.spacy_model_name}': {e}", exc_info=True)
 
         if pipeline is None:
@@ -106,18 +106,18 @@ class ContextAgent:
             try:
                 self.intent_classifier = pipeline("zero-shot-classification", model=self.agent_config.intent_classifier_model)
                 self.logger.info(f"Intent classifier '{self.agent_config.intent_classifier_model}' loaded.")
-            except Exception as e:
+            except Exception as e: 
                 self.logger.error(f"Failed to load intent classifier '{self.agent_config.intent_classifier_model}': {e}", exc_info=True)
-
-        if self.state_manager is None:
+        
+        if self.state_manager is None: 
             self.logger.info(f"Initializing StateManager (type: {self.agent_config.state_manager_type})")
             if self.agent_config.state_manager_type == "redis":
                 try:
                     self.state_manager = RedisStateManager(host=self.agent_config.redis_host, port=self.agent_config.redis_port)
-                except ImportError as ie:
+                except ImportError as ie: 
                     self.logger.error(f"aioredis import failed for RedisStateManager: {ie}. Falling back to InMemoryStateManager.", exc_info=True)
                     self.state_manager = InMemoryStateManager()
-                except Exception as e:
+                except Exception as e: 
                     self.logger.error(f"RedisStateManager init failed (host: {self.agent_config.redis_host}): {e}. Falling back to InMemoryStateManager.", exc_info=True)
                     self.state_manager = InMemoryStateManager()
             elif self.agent_config.state_manager_type == "in_memory":
@@ -164,19 +164,19 @@ class ContextAgent:
                         if intent == "search_info": entities["query"] = entity_text
                         elif intent == "save_info": entities["data"] = entity_text
                         elif intent == "summarization_intent": entities["text_to_summarize"] = entity_text
-
+            
             if not used_spacy or confidence < self.agent_config.high_confidence_threshold:
                 if self.intent_classifier:
                     try:
                         res = self.intent_classifier(processed_input, self.agent_config.intent_candidate_labels, multi_label=False)
                         if res and res['labels']: intent, confidence = res['labels'][0], res['scores'][0]
                         else: self.logger.warning("Zero-shot classifier returned no labels."); intent, confidence = "general_question", self.agent_config.default_intent_confidence
-                    except Exception as e_clf:
+                    except Exception as e_clf: 
                         self.logger.error(f"Zero-shot classification error: {e_clf}", exc_info=True)
                         if not used_spacy: intent, confidence = "general_question", self.agent_config.default_intent_confidence
                         raise ExternalServiceError(f"Zero-shot classifier failed: {e_clf}") from e_clf
                 elif not used_spacy: intent, confidence = "general_question", self.agent_config.default_intent_confidence
-
+            
             # spaCy NER
             for ent in spacy_doc.ents:
                 label = ent.label_.lower()
@@ -184,10 +184,10 @@ class ContextAgent:
             for k, v_list in entities.items(): # Consolidate list values
                 if isinstance(v_list, list): entities[k] = ", ".join(v_list)
             return IntentExtractionResult(intent=intent, entities=entities, confidence=confidence, original_input=processed_input, spacy_doc=spacy_doc, matched_patterns=patterns)
-        except AttributeError as ae:
+        except AttributeError as ae: 
             self.logger.error(f"AttributeError in detect_intent (spaCy/Matcher issue?): {ae}", exc_info=True)
             raise IntentDetectionError(f"Component (spaCy/Matcher) error: {ae}") from ae
-        except Exception as e:
+        except Exception as e: 
             self.logger.error(f"Unexpected error in detect_intent for '{processed_input}': {e}", exc_info=True)
             raise IntentDetectionError(f"Unexpected error in intent detection: {e}") from e
 
@@ -205,7 +205,7 @@ class ContextAgent:
             else: params["error_message"] = f"Unknown or unhandled intent: {intent}"
             self.logger.info(f"Route: Target='{target}', Params='{params}'.")
             return RoutingDecision(target_module=target, task_parameters=params, original_intent=intent_result)
-        except Exception as e:
+        except Exception as e: 
             self.logger.error(f"Critical error in decide_route for intent '{intent_result.intent}': {e}", exc_info=True)
             return RoutingDecision(target_module="ErrorHandler", task_parameters={"error_message": "Critical routing error.", "details": str(e), "original_intent_info": intent_result.model_dump(exclude_none=True, exclude={'spacy_doc'})}, original_intent=intent_result)
 
@@ -227,14 +227,14 @@ class ContextAgent:
                 return TaskResult(status="success", data=res, message="LLMListener processed.")
             elif target == "ErrorHandler":
                 return TaskResult(status="error", message=params.get("error_message", "Error handled."), error_details=params)
-            else:
+            else: 
                 self.logger.warning(f"Unknown module for dispatch: '{target}'.")
                 raise CoreLogicError(f"Unknown module for dispatch: {target}")
         except (ConfigurationError, CoreLogicError) as e: self.logger.error(f"Dispatch error: {e}", exc_info=True); raise
         except (EmbeddingError, MemoryAccessError, SummarizationError, PipelineError, ExternalServiceError) as e_service:
             self.logger.error(f"Service error in '{target}': {e_service}", exc_info=True)
             raise ExternalServiceError(f"Error in {target}: {e_service}") from e_service
-        except Exception as e:
+        except Exception as e: 
             self.logger.error(f"Unexpected dispatch error to '{target}': {e}", exc_info=True)
             raise CoreLogicError(f"Unexpected dispatch error to {target}: {e}") from e
 
@@ -247,7 +247,7 @@ class ContextAgent:
                     retrieved_state = await self.state_manager.get_state(conversation_id)
                     if retrieved_state: current_context = {**retrieved_state, **current_context}
                 except MemoryAccessError as e: self.logger.error(f"State retrieval failed for {conversation_id}: {e}", exc_info=True) # Proceed without state
-
+            
             processed_input = self.process_input(raw_input)
             if not processed_input and raw_input not in [None, ""]:
                  return TaskResult(status="error", message="Input processing failed.", error_details={"original_input": str(raw_input)[:200]})
@@ -261,14 +261,14 @@ class ContextAgent:
                     state_to_save = {"last_user_input": processed_input, "last_intent": intent_res.intent, "last_entities": intent_res.entities, "last_task_module": route_decision.target_module, "last_task_status": task_result.status, "timestamp": datetime.datetime.utcnow().isoformat()}
                     await self.state_manager.save_state(conversation_id, state_to_save)
                 except MemoryAccessError as e: self.logger.error(f"State saving failed for {conversation_id}: {e}", exc_info=True) # Non-critical for current result
-
+            
             self.logger.info(f"Request handled. Final status: {task_result.status}")
             return task_result
-
+        
         except (IntentDetectionError, ConfigurationError, ExternalServiceError, CoreLogicError, MemoryAccessError) as e:
             self.logger.error(f"{type(e).__name__} in handle_request: {e}", exc_info=True)
             return TaskResult(status="error", message=f"{type(e).__name__}: {str(e)[:100]}", error_details={"type": type(e).__name__, "details": str(e)})
-        except Exception as e:
+        except Exception as e: 
             self.logger.error(f"Unexpected critical error in handle_request for {conversation_id or 'N/A'}: {e}", exc_info=True)
             return TaskResult(status="error", message=f"Unexpected critical error: {str(e)[:100]}", error_details={"type": type(e).__name__, "details": str(e)})
 

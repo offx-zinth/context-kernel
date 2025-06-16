@@ -159,7 +159,10 @@ class GraphIndexer:
         A dedicated coreference model/component (e.g., from spacy-experimental or a Hugging Face model)
         would be needed for a full implementation.
         """
-        logger.debug(f"Co-reference resolution for chunk ID: {chunk_id} is currently a stub.")
+        logger.warning(f"Co-reference resolution for chunk ID: {chunk_id} is a STUB. "
+                       f"A production implementation would involve a dedicated model (e.g., from spaCy-experimental, "
+                       f"Hugging Face, or a commercial NLP provider) to identify and link pronoun references "
+                       f"to their corresponding entities. This step is currently bypassed, and entities are returned as is.")
         # In a real implementation, this would involve processing text_data and entities
         # with a coreference resolution model and updating entity mentions.
         return entities
@@ -314,10 +317,33 @@ class GraphIndexer:
 
         nlp_extractions = await self._extract_entities_topics_intents(chunk_id, parsed_data)
 
+        # Check for NLP extraction failure
+        if "nlp_error" in nlp_extractions.get("intents", []) or \
+           (not nlp_extractions.get("entities") and not nlp_extractions.get("topics")): # Heuristic for error
+            logger.warning(f"NLP extraction may have failed or returned empty for chunk {chunk_id}. "
+                           f"Intents: {nlp_extractions.get('intents', [])}. Entities: {len(nlp_extractions.get('entities',[]))}, Topics: {len(nlp_extractions.get('topics',[]))}. "
+                           f"Proceeding with minimal graph elements.")
+            # Ensure structure is consistent for downstream processing even if empty
+            nlp_extractions["entities"] = nlp_extractions.get("entities", [])
+            nlp_extractions["topics"] = nlp_extractions.get("topics", [])
+            nlp_extractions["intents"] = nlp_extractions.get("intents", ["unknown_due_to_nlp_error"])
+
+
         entities_after_coref = await self._resolve_coreferences(chunk_id, text_content_for_nlp, nlp_extractions["entities"])
         nlp_extractions["entities"] = entities_after_coref
 
         embedding = await self._generate_embeddings(chunk_id, text_content_for_nlp)
+
+        # Check for embedding generation failure
+        # A zero vector is returned by _generate_embeddings on failure if text_content_for_nlp was not empty.
+        # If text_content_for_nlp was empty, it also returns a zero vector, which is expected.
+        if text_content_for_nlp and embedding == ([0.0] * self.embedding_dimension if self.embedding_dimension else [0.0] * 384): # Using fallback dimension if not set
+             logger.warning(f"Embedding generation failed for chunk {chunk_id} (input text was non-empty). "
+                            f"A zero vector will be used. Graph node 'embedding_vector_stub' may not be meaningful.")
+        elif not text_content_for_nlp and embedding is None: # Should be zero vector from _generate_embeddings
+             logger.warning(f"Embedding generation for chunk {chunk_id} resulted in None, likely due to empty text and model not initialized. Defaulting to zero vector.")
+             embedding = [0.0] * (self.embedding_dimension or 384)
+
 
         nodes_to_create, edges_to_create = await self._construct_graph_elements(
             chunk_id, parsed_data, nlp_extractions, embedding
@@ -555,6 +581,8 @@ async def main():
 
     result2 = await indexer.process_memory_chunk(chunk2_id, chunk2_data_dict)
     result3 = await indexer.process_memory_chunk(chunk3_id, chunk3_data)
+    logger.info(f"Result for {chunk3_id} (empty data): {json.dumps(result3, indent=2)}")
+
 
     logger.info(f"--- Reprocessing {chunk1_id} to test idempotency and caching ---")
     # This call to _generate_embeddings should hit the cache for chunk1_data
