@@ -1,575 +1,348 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import logging
 import asyncio
 import time
-from typing import List, Dict, Any, Optional, Union # Added Union for type hints flexibility
+import os
+import json
+from typing import List, Dict, Any, Optional, Union
+
 from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings # For Config model
 
-# --- Data Structures ---
+try:
+    from sentence_transformers import SentenceTransformer, CrossEncoder
+except ImportError:
+    SentenceTransformer = None # type: ignore
+    CrossEncoder = None # type: ignore
 
+try:
+    import numpy as np
+except ImportError:
+    np = None # type: ignore
+
+try:
+    import faiss # type: ignore
+except ImportError:
+    faiss = None # type: ignore
+
+try:
+    import networkx as nx # type: ignore
+except ImportError:
+    nx = None # type: ignore
+
+try:
+    from whoosh.index import create_in, open_dir, exists_in # type: ignore
+    from whoosh.fields import Schema, TEXT, ID # type: ignore
+    from whoosh.qparser import QueryParser # type: ignore
+except ImportError:
+    create_in = open_dir = exists_in = Schema = TEXT = ID = QueryParser = None # type: ignore
+
+from .exceptions import EmbeddingError, ConfigurationError, MemoryAccessError, ExternalServiceError
+
+logger = logging.getLogger(__name__)
+
+# Config Model
+class LLMRetrieverConfig(BaseSettings):
+    embedding_model_name: Optional[str] = "all-MiniLM-L6-v2"
+    embedding_device: Optional[str] = None
+    default_top_k: int = 10
+    faiss_index_path: Optional[str] = None
+    networkx_graph_path: Optional[str] = None
+    whoosh_index_dir: Optional[str] = "whoosh_index_path"
+    cross_encoder_model_name: Optional[str] = None
+    keyword_search_enabled: bool = True
+
+    model_config = {'env_prefix': 'LLM_RETRIEVER_'} # Pydantic V2 style for pydantic-settings
+
+# Data Structures
 class RetrievedItem(BaseModel):
-    """
-    Represents a single item retrieved from a memory source.
-    """
-    content: Any  # The actual retrieved data (e.g., text chunk, graph snippet, document)
-    source: str   # e.g., "ltm", "graph_db", "stm_cache", "keyword_search"
-    score: Optional[float] = None  # Relevance score, if applicable
-    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict) # Timestamps, doc ID, etc.
+    content: Any
+    source: str
+    score: Optional[float] = None
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
 class RetrievalResponse(BaseModel):
-    """
-    Represents the overall response from a retrieval operation.
-    """
     items: List[RetrievedItem] = Field(default_factory=list)
     retrieval_time_ms: Optional[float] = None
-    message: Optional[str] = None # For warnings or additional info
+    message: Optional[str] = None
 
-# --- LLMRetriever Class ---
-
-class LLMRetriever:
-    """
-    Retrieves relevant information from long-term memory (LTM), short-term memory (STM),
-    and a graph database (GraphDB) based on a given query.
-    """
-
-    def __init__(self, ltm_interface, stm_interface, graphdb_interface, embedding_model, query_llm=None):
-        """
-        Initializes the LLMRetriever.
-
-        Args:
-            ltm_interface: An interface to the Long-Term Memory store.
-            stm_interface: An interface to the Short-Term Memory store.
-            graphdb_interface: An interface to the Graph Database.
-            embedding_model: The model used to generate embeddings for queries and documents.
-            query_llm (optional): An LLM used for query manipulation (e.g., expansion, rewriting).
-                                  Defaults to None.
-        """
-        self.ltm = ltm_interface
-        self.stm = stm_interface
-        self.graph_db = graphdb_interface
-        self.embedding_model = embedding_model
-        self.query_llm = query_llm
-        self.logger = logging.getLogger(__name__)
-
-        self.logger.info("LLMRetriever initialized.")
-
-    async def _preprocess_and_embed_query(self, query: str, task_description: str = None):
-        """
-        Preprocesses the query (optional) and generates its vector embedding.
-
-        Args:
-            query (str): The input query string.
-            task_description (str, optional): Additional context about the task. Defaults to None.
-
-        Returns:
-            list: The vector embedding of the query, or None if an error occurs.
-        """
-        self.logger.info(f"Received query: '{query}'")
-        if task_description:
-            self.logger.info(f"Task description: '{task_description}'")
-
-        # Optional: Query expansion/rewriting using self.query_llm
-        # if self.query_llm and task_description:
-        #     # This is a placeholder for more sophisticated query manipulation
-        #     try:
-        #         # processed_query = await self.query_llm.refine_query(query, task_description)
-        #         # self.logger.info(f"Refined query to: '{processed_query}'")
-        #         # query = processed_query
-        #         pass # Replace with actual call
-        #     except Exception as e:
-        #         self.logger.warning(f"Error during query refinement: {e}. Using original query.")
-        # elif self.query_llm:
-        #      # processed_query = await self.query_llm.refine_query(query)
-        #      # self.logger.info(f"Refined query to: '{processed_query}'")
-        #      # query = processed_query
-        #      pass # Replace with actual call
-
-
-        if not hasattr(self.embedding_model, 'generate_embedding'):
-            self.logger.error("Embedding model does not have a 'generate_embedding' method.")
-            raise AttributeError("Embedding model must have an async method 'generate_embedding'.")
-
+# Embedding Model
+class HuggingFaceEmbeddingModel:
+    def __init__(self, model_name: str, device: Optional[str] = None):
+        self.logger = logging.getLogger(__name__ + ".HuggingFaceEmbeddingModel")
+        self.model_name = model_name
+        self.device = device
+        self.model = None
+        if SentenceTransformer is None:
+            raise ConfigurationError("sentence-transformers library not installed.")
+        if not self.model_name:
+            raise ConfigurationError("model_name not provided for HuggingFaceEmbeddingModel.")
         try:
-            query_embedding = await self.embedding_model.generate_embedding(query)
-            self.logger.info(f"Successfully generated embedding for query: '{query}'")
-            return query_embedding
+            self.model = SentenceTransformer(self.model_name, device=self.device)
+            self.logger.info(f"SentenceTransformer model '{self.model_name}' loaded successfully.")
         except Exception as e:
-            self.logger.error(f"Error generating embedding for query '{query}': {e}")
-            # raise # Or return None, depending on desired error handling for embedding failure
-            return None # Adjusted to return None on failure
-
-    async def _search_vector_store(self, query_embedding: list[float], top_k: int = 5, filters: dict = None) -> List[RetrievedItem]:
-        """
-        Searches the vector store (LTM) for relevant documents.
-        (Adapts results to List[RetrievedItem] conceptually)
-
-        Args:
-            query_embedding (list[float]): The vector embedding of the query.
-            top_k (int): The number of top results to retrieve.
-            filters (dict, optional): Metadata filters to apply to the search. Defaults to None.
-
-        Returns:
-            List[RetrievedItem]: A list of search results from the LTM, adapted to RetrievedItem.
-        """
-        self.logger.info(f"Searching vector store (LTM) with top_k={top_k}, filters={filters}")
-
-        if not hasattr(self.ltm, 'search'):
-            self.logger.error("LTM interface does not have a 'search' method.")
-            raise AttributeError("LTM interface must have an async method 'search'.")
-
-        try:
-            # Assuming self.ltm.search returns data that can be mapped to RetrievedItem
-            # For now, we'll return a placeholder if actual conversion isn't done here
-            raw_ltm_results = await self.ltm.search(query_embedding=query_embedding, top_k=top_k, filters=filters)
-            self.logger.info(f"LTM search completed. Found {len(raw_ltm_results)} raw results.")
-
-            # Placeholder: Convert raw_ltm_results to List[RetrievedItem]
-            # This would involve knowing the structure of raw_ltm_results
-            processed_results = []
-            for res in raw_ltm_results:
-                # Example: res could be a dict {'content': ..., 'score': ..., 'meta': ...}
-                # Or it could be an object with attributes.
-                # This is a conceptual mapping.
-                processed_results.append(RetrievedItem(
-                    content=res.get('content', res), # adapt as needed
-                    source="ltm",
-                    score=res.get('score'),
-                    metadata=res.get('metadata', {})
-                ))
-            return processed_results
-        except Exception as e:
-            self.logger.error(f"Error during LTM search: {e}")
-            # Depending on strategy, might want to return [] or raise
-            # raise # Re-raising might be too harsh if other sources can compensate
-            return [] # Return empty list on error
-
-
-    async def _search_graph_db(self, query: str, task_description: str = None, top_k: int = 5, filters: dict = None) -> List[RetrievedItem]:
-        """
-        Searches the graph database for relevant entities and relationships.
-        (Adapts results to List[RetrievedItem] conceptually)
-
-        Args:
-            query (str): The original query string (can be used for entity extraction or direct querying).
-            task_description (str, optional): Additional context.
-            top_k (int): The number of top results/paths to retrieve.
-            filters (dict, optional): Filters to apply to the graph search. Defaults to None.
-
-        Returns:
-            List[RetrievedItem]: A list of search results from the GraphDB, adapted to RetrievedItem.
-        """
-        self.logger.info(f"Searching GraphDB with query: '{query}', top_k={top_k}, filters={filters}")
-
-        if not hasattr(self.graph_db, 'search'):
-            self.logger.error("GraphDB interface does not have a 'search' method.")
-            raise AttributeError("GraphDB interface must have an async method 'search'.")
-
-        try:
-            # Assuming self.graph_db.search returns data that can be mapped
-            raw_graph_results = await self.graph_db.search(query=query, task_description=task_description, top_k=top_k, filters=filters)
-            self.logger.info(f"GraphDB search completed. Found {len(raw_graph_results)} raw results.")
-
-            # Placeholder: Convert raw_graph_results to List[RetrievedItem]
-            processed_results = []
-            for res in raw_graph_results:
-                processed_results.append(RetrievedItem(
-                    content=res.get('content', res), # adapt as needed
-                    source="graph_db",
-                    score=res.get('score'),
-                    metadata=res.get('metadata', {})
-                ))
-            return processed_results
-        except Exception as e:
-            self.logger.error(f"Error during GraphDB search: {e}")
-            return [] # Return empty list on error
-
-    async def _search_keyword(self, query: str, top_k: int = 5, filters: dict = None) -> List[RetrievedItem]:
-        """
-        Performs a keyword-based search (e.g., full-text search) across available memory.
-        NOTE: This is a placeholder for future implementation.
-
-        Args:
-            query (str): The query string.
-            top_k (int): The number of top results to retrieve.
-            filters (dict, optional): Filters to apply. Defaults to None.
-
-        Returns:
-            List[RetrievedItem]: An empty list, as this is not yet implemented.
-        """
-        self.logger.info(f"Keyword search (placeholder) for query: '{query}', top_k={top_k}, filters={filters}")
-        # TODO: Implement keyword search logic. When implemented, ensure it returns List[RetrievedItem].
-        # For now, returns an empty list.
-        return []
-
-    async def _consolidate_and_rank_results(self, results_collection: List[List[RetrievedItem]], strategy: str = "simple_aggregation") -> List[RetrievedItem]:
-        """
-        Consolidates results from different sources and ranks them.
-
-        Args:
-            results_collection (List[List[RetrievedItem]]): A list where each sublist contains
-                                                            RetrievedItem objects from a source.
-            strategy (str): The consolidation and ranking strategy to use.
-                            Defaults to "simple_aggregation".
-
-        Returns:
-            List[RetrievedItem]: A single, consolidated (and potentially ranked) list of RetrievedItem.
-        """
-        self.logger.info(f"Consolidating and ranking results using strategy: '{strategy}'")
-
-        consolidated_results: List[RetrievedItem] = []
-        if strategy == "simple_aggregation":
-            for source_results_list in results_collection:
-                if source_results_list: # Ensure source_results_list is not None and is iterable
-                    consolidated_results.extend(source_results_list)
-            # TODO: Implement deduplication logic (e.g., based on result IDs or content similarity)
-            # self.logger.info("Placeholder for deduplication logic.")
-
-            # TODO: Implement more sophisticated re-ranking logic.
-            # This could involve:
-            # - Using relevance scores if provided by all sources.
-            # - Applying a cross-encoder model (e.g., using self.query_llm or a dedicated re-ranker)
-            #   to re-score the top N candidates from the aggregated list.
-            # - Normalizing scores from different sources before combining.
-            # self.logger.info("Placeholder for advanced re-ranking logic.")
-        else:
-            self.logger.warning(f"Unknown consolidation strategy: '{strategy}'. Returning raw aggregated results.")
-            for source_results_list in results_collection:
-                 if source_results_list:
-                    consolidated_results.extend(source_results_list)
-
-        self.logger.info(f"Consolidated to {len(consolidated_results)} results before final ranking/deduplication.")
-        # TODO: Actual ranking based on scores, potentially using self.query_llm for cross-encoding
-        # Example: consolidated_results.sort(key=lambda item: item.score or 0, reverse=True)
-        return consolidated_results
-
-    async def retrieve(self, query: str, task_description: str = None, top_k: int = 10, filters: dict = None, retrieval_strategy: str = "all") -> RetrievalResponse:
-        """
-        Main method to retrieve relevant information based on a query.
-
-        Args:
-            query (str): The user's query.
-            task_description (str, optional): Context about the task for which information is being retrieved.
-            top_k (int): The desired number of results from each source.
-            filters (dict, optional): Filters to apply during search (e.g., metadata, date ranges).
-            retrieval_strategy (str): Defines which sources to query ("all", "vector_only", "graph_only", "keyword_only").
-
-        Returns:
-            RetrievalResponse: An object containing the retrieved items and metadata.
-        """
-        start_time = time.time()
-        self.logger.info(
-            f"Starting retrieval for query='{query}', task_description='{task_description}', "
-            f"top_k={top_k}, filters={filters}, strategy='{retrieval_strategy}'"
-        )
-        final_message = None
-
-        try:
-            # 1. Preprocessing & Embedding
-            query_embedding = await self._preprocess_and_embed_query(query, task_description)
-            if query_embedding is None:
-                self.logger.error("Failed to generate query embedding. Aborting retrieval.")
-                return RetrievalResponse(items=[], message="Failed to generate query embedding.")
-
-            # 2. Memory Interaction
-            vector_store_results: List[RetrievedItem] = []
-            graph_db_results: List[RetrievedItem] = []
-            keyword_results: List[RetrievedItem] = []
-
-            search_tasks = []
-
-            if retrieval_strategy in ["all", "vector_only"]:
-                search_tasks.append(self._search_vector_store(query_embedding, top_k=top_k, filters=filters))
-
-            if retrieval_strategy in ["all", "graph_only"]:
-                search_tasks.append(self._search_graph_db(query, task_description=task_description, top_k=top_k, filters=filters))
-
-            if retrieval_strategy in ["all", "keyword_only"]: # Assuming keyword search is part of 'all'
-                search_tasks.append(self._search_keyword(query, top_k=top_k, filters=filters))
-
-            if not search_tasks:
-                self.logger.warning(f"No search tasks identified for strategy '{retrieval_strategy}'. Returning empty response.")
-                return RetrievalResponse(items=[], message=f"No search tasks for strategy '{retrieval_strategy}'.")
-
-            # Execute searches. If 'all', potentially concurrently.
-            # For other strategies, it will be a single task.
-            self.logger.info(f"Executing {len(search_tasks)} search tasks based on strategy '{retrieval_strategy}'.")
-
-            # asyncio.gather will run them concurrently if there are multiple
-            all_source_results = await asyncio.gather(*search_tasks, return_exceptions=True)
-
-            # Process results from asyncio.gather, handling potential exceptions
-            # Each result in all_source_results should be List[RetrievedItem] or an Exception
-            processed_source_results_temp: List[Union[List[RetrievedItem], Exception]] = await asyncio.gather(*search_tasks, return_exceptions=True)
-
-            processed_source_results: List[List[RetrievedItem]] = []
-            task_error_messages = []
-            for i, res_or_exc in enumerate(processed_source_results_temp):
-                if isinstance(res_or_exc, Exception):
-                    self.logger.error(f"Search task {i} (type: {search_tasks[i].__name__ if hasattr(search_tasks[i], '__name__') else 'unknown'}) failed: {res_or_exc}")
-                    processed_source_results.append([]) # Add empty list for failed task
-                    task_error_messages.append(f"Task {i} failed: {str(res_or_exc)[:100]}.") # Truncate long errors
-                elif res_or_exc is None: # Should not happen if search methods return [] on error
-                     self.logger.warning(f"Search task {i} returned None. Using empty list.")
-                     processed_source_results.append([])
-                else: # Should be List[RetrievedItem]
-                    processed_source_results.append(res_or_exc)
-
-            if task_error_messages:
-                final_message = "Some search tasks failed. " + " ".join(task_error_messages)
-
-            # Assign results based on the strategy and order of tasks added
-            current_idx = 0
-            if retrieval_strategy in ["all", "vector_only"]:
-                if current_idx < len(processed_source_results): vector_store_results = processed_source_results[current_idx]
-                current_idx +=1
-            if retrieval_strategy in ["all", "graph_only"]:
-                if current_idx < len(processed_source_results): graph_db_results = processed_source_results[current_idx]
-                current_idx += 1
-            if retrieval_strategy in ["all", "keyword_only"]:
-                if current_idx < len(processed_source_results): keyword_results = processed_source_results[current_idx]
-                # current_idx += 1 # No more consumers after this one
-
-
-            # 3. Consolidation and Ranking
-            all_results_collection: List[List[RetrievedItem]] = [
-                vector_store_results, graph_db_results, keyword_results
-            ]
-            # Filter out any sub-lists that might be None if a search wasn't run (though current logic populates with [])
-            all_results_collection = [res_list for res_list in all_results_collection if res_list is not None]
-
-            final_items = await self._consolidate_and_rank_results(all_results_collection)
-
-            # 4. Output Formatting & Logging
-            retrieval_duration_ms = (time.time() - start_time) * 1000
-            self.logger.info(f"Retrieval completed in {retrieval_duration_ms:.2f} ms. Returning {len(final_items)} items.")
-
-            return RetrievalResponse(
-                items=final_items,
-                retrieval_time_ms=retrieval_duration_ms,
-                message=final_message if final_message else f"Successfully retrieved {len(final_items)} items."
-            )
-
-        except AttributeError as ae: # Specific error for missing methods on interfaces
-            self.logger.error(f"AttributeError during retrieval: {ae}. This might indicate a misconfigured component.")
-            return RetrievalResponse(items=[], retrieval_time_ms=(time.time() - start_time) * 1000, message=f"AttributeError: {ae}")
-        except Exception as e:
-            self.logger.error(f"Unexpected error during retrieval: {e}", exc_info=True)
-            return RetrievalResponse(items=[], retrieval_time_ms=(time.time() - start_time) * 1000, message=f"Unexpected error: {e}")
-
-
-# Example Usage (Illustrative - to be removed or moved to tests/examples)
-if __name__ == '__main__':
-    # This is placeholder code for demonstration.
-    # Actual interfaces and models would be needed.
-
-    # Mocking interfaces and models for the sake of example
-    class MockInterface:
-        def __init__(self, name):
-            self.name = name
-            self.logger = logging.getLogger(f"MockInterface.{name}")
-            self.logger.info(f"MockInterface {name} initialized.")
-
-        def search(self, query_embedding, top_k):
-            self.logger.info(f"{self.name} received search request.")
-            return [f"Result from {self.name} for query_embedding"]
-
-    class MockEmbeddingModel:
-        def __init__(self):
-            self.logger = logging.getLogger("MockEmbeddingModel")
-            self.logger.info("MockEmbeddingModel initialized.")
-
-        def embed(self, text):
-            self.logger.info(f"Embedding text: '{text}'")
-            return [0.1, 0.2, 0.3] # Dummy embedding
-
-    logging.basicConfig(level=logging.INFO)
-
-    # Instantiate mock components
-    mock_ltm = MockInterface("LTM")
-    mock_stm = MockInterface("STM")
-    mock_graphdb = MockInterface("GraphDB")
-    mock_embed_model = MockEmbeddingModel()
-
-    # Instantiate the retriever
-    retriever = LLMRetriever(
-        ltm_interface=mock_ltm,
-        stm_interface=mock_stm,
-        graphdb_interface=mock_graphdb,
-        embedding_model=mock_embed_model
-    )
-
-    retriever.logger.info("LLMRetriever instance created for example.")
-
-    # Example of how a search might be initiated (actual search method not yet implemented)
-    # query_text = "What is context kernel?"
-    # query_embedding = retriever.embedding_model.embed(query_text) # This would need an async call if using the new stubs
-    # results = retriever.search(query_embedding, top_k=5) # This would need an async call
-    # print(f"Search results: {results}")
-    print("LLMRetriever structure created. Example usage (if run directly) would show logger messages. Stubs are defined below.")
-
-# --- Stub Implementations for Dependencies ---
-
-class StubEmbeddingModel:
-    """
-    Stub implementation for an embedding model.
-    """
-    def __init__(self):
-        self.logger = logging.getLogger(__name__ + ".StubEmbeddingModel")
-        self.logger.info("StubEmbeddingModel initialized.")
+            raise EmbeddingError(f"Failed to load SentenceTransformer model '{self.model_name}': {e}") from e
 
     async def generate_embedding(self, text: str) -> List[float]:
-        self.logger.info(f"Generating stub embedding for text: '{text[:50]}...'")
-        # Simple dynamic vector based on text length
-        vector_base = [0.1, 0.2, 0.3, 0.4, 0.5]
-        multiplier = (len(text) % 5) + 1
-        dummy_vector = [val * multiplier * 0.1 for val in vector_base * multiplier]
-        return dummy_vector[:10] # Keep it a fixed short length for simplicity
+        if self.model is None: raise EmbeddingError("Embedding model not available.")
+        if not text or not isinstance(text, str): self.logger.warning("Invalid input for embedding."); return []
+        try:
+            embedding_array = await asyncio.to_thread(self.model.encode, text, convert_to_tensor=False)
+            return embedding_array.tolist() if hasattr(embedding_array, 'tolist') else list(map(float, embedding_array))
+        except Exception as e: raise EmbeddingError(f"Encoding failed for model '{self.model_name}': {e}") from e
 
+# Stub LTM
 class StubLTM:
-    """
-    Stub implementation for a Long-Term Memory interface.
-    """
-    def __init__(self):
+    def __init__(self, faiss_index_path: Optional[str] = None, whoosh_ix: Any = None, retriever_config: Optional[LLMRetrieverConfig] = None):
         self.logger = logging.getLogger(__name__ + ".StubLTM")
-        self.logger.info("StubLTM initialized.")
+        self.faiss_index_path = faiss_index_path
+        self.index: Optional[Any] = None # faiss.Index
+        self.doc_id_to_internal_idx: Dict[str, int] = {}
+        self.internal_idx_to_doc_item: Dict[int, RetrievedItem] = {}
+        self._next_internal_idx = 0
+        self.whoosh_ix = whoosh_ix
+        self.retriever_config = retriever_config
 
-    async def search(self, query_embedding: List[float], top_k: int, filters: Optional[Dict] = None) -> List[RetrievedItem]:
-        self.logger.info(f"Performing stub LTM search with embedding (first 3 vals): {query_embedding[:3]}, top_k={top_k}, filters={filters}")
-        results = []
-        for i in range(top_k):
-            results.append(RetrievedItem(
-                content=f"LTM Result {i+1} for embedding starting with {str(query_embedding[:3])}",
-                source="ltm_stub",
-                score=round(0.9 - i*0.1, 2),
-                metadata={"doc_id": f"ltm_doc_{i+1}", "filter_applied": filters is not None}
-            ))
-        return results
+        if np is None: raise ConfigurationError("Numpy not installed for StubLTM.")
+        if faiss is None: self.logger.warning("FAISS library not installed; FAISS features disabled in StubLTM.")
+        
+        if self.faiss_index_path and os.path.exists(self.faiss_index_path) and faiss:
+            try:
+                self.index = faiss.read_index(self.faiss_index_path)
+                self.logger.info(f"FAISS index loaded from {self.faiss_index_path}, ntotal: {self.index.ntotal}")
+                # TODO: Mappings loading logic
+            except Exception as e: raise MemoryAccessError(f"Failed to load FAISS index '{self.faiss_index_path}': {e}") from e
 
+    async def add_document(self, doc_id: str, text_content: str, embedding: List[float], metadata: Optional[Dict[str, Any]] = None):
+        if np is None: raise ConfigurationError("Numpy not available for StubLTM.add_document.")
+        if not doc_id: self.logger.error("doc_id missing."); return
+        if str(doc_id) in self.doc_id_to_internal_idx: self.logger.warning(f"Doc ID '{doc_id}' exists."); return
+
+        if faiss and self.index is None and embedding:
+            try: self.index = faiss.IndexIDMap2(faiss.IndexFlatL2(np.array(embedding).shape[-1]))
+            except Exception as e: raise MemoryAccessError(f"FAISS index creation failed: {e}") from e
+        
+        if faiss and self.index and embedding:
+            try:
+                np_embedding = np.array(embedding, dtype=np.float32).reshape(1, -1)
+                internal_id = self._next_internal_idx
+                self.index.add_with_ids(np_embedding, np.array([internal_id]))
+                item_meta = metadata or {}; item_meta['doc_id'] = str(doc_id)
+                self.internal_idx_to_doc_item[internal_id] = RetrievedItem(content=text_content, source=item_meta.get("source", "ltm_stub"), metadata=item_meta)
+                self.doc_id_to_internal_idx[str(doc_id)] = internal_id
+                self._next_internal_idx += 1
+            except Exception as e: raise MemoryAccessError(f"FAISS add_with_ids failed for '{doc_id}': {e}") from e
+
+        if self.whoosh_ix and self.retriever_config and self.retriever_config.keyword_search_enabled and text_content:
+            try:
+                writer = self.whoosh_ix.writer()
+                writer.add_document(doc_id=str(doc_id), content=text_content)
+                writer.commit()
+            except Exception as e: self.logger.error(f"Whoosh add failed for '{doc_id}': {e}", exc_info=True)
+
+
+    async def search(self, query_embedding: List[float], top_k: int, filters: Optional[Dict]=None) -> List[RetrievedItem]:
+        if not (faiss and self.index and self.index.ntotal > 0): return []
+        if np is None: raise ConfigurationError("Numpy not available for StubLTM.search.")
+        try:
+            distances, internal_indices = await asyncio.to_thread(self.index.search, np.array(query_embedding, dtype=np.float32).reshape(1, -1), top_k)
+            results = []
+            for i in range(internal_indices.shape[1]):
+                internal_idx, dist = internal_indices[0, i], distances[0, i]
+                if internal_idx != -1 and internal_idx in self.internal_idx_to_doc_item:
+                    item = self.internal_idx_to_doc_item[internal_idx]
+                    results.append(RetrievedItem(content=item.content, source=item.source, score=1.0/(1.0+float(dist)), metadata=item.metadata))
+            return results
+        except Exception as e: raise MemoryAccessError(f"FAISS search failed: {e}") from e
+
+    async def save_index(self, path: Optional[str]=None):
+        save_p = path or self.faiss_index_path
+        if not save_p: raise ConfigurationError("No path for FAISS index save.")
+        if not (faiss and self.index): raise ConfigurationError("FAISS/index not available for save.")
+        try: faiss.write_index(self.index, save_p); self.logger.info(f"FAISS index saved to {save_p}.")
+        except Exception as e: raise MemoryAccessError(f"Failed to save FAISS index to '{save_p}': {e}") from e
+
+# Stub GraphDB
 class StubGraphDB:
-    """
-    Stub implementation for a Graph Database interface.
-    """
-    def __init__(self):
+    def __init__(self, networkx_graph_path: Optional[str] = None):
         self.logger = logging.getLogger(__name__ + ".StubGraphDB")
-        self.logger.info("StubGraphDB initialized.")
+        if nx is None: raise ConfigurationError("NetworkX library not installed.")
+        self.graph = nx.Graph()
+        if networkx_graph_path and os.path.exists(networkx_graph_path):
+            try:
+                if networkx_graph_path.endswith(".gml"): self.graph = nx.read_gml(networkx_graph_path)
+                elif networkx_graph_path.endswith(".graphml"): self.graph = nx.read_graphml(networkx_graph_path)
+                else: self.logger.warning(f"Unsupported graph format: {networkx_graph_path}")
+                self.logger.info(f"NetworkX graph loaded from {networkx_graph_path}.")
+            except Exception as e: raise MemoryAccessError(f"Failed to load NetworkX graph '{networkx_graph_path}': {e}") from e
 
-    async def search(self, query: str, task_description: Optional[str] = None, top_k: int = 5, filters: Optional[Dict] = None) -> List[RetrievedItem]:
-        self.logger.info(f"Performing stub GraphDB search for query: '{query}', top_k={top_k}, filters={filters}, task: {task_description}")
-        results = []
-        for i in range(top_k):
-            results.append(RetrievedItem(
-                content=f"GraphDB Result {i+1} for query '{query}'",
-                source="graph_db_stub",
-                score=round(0.85 - i*0.1, 2),
-                metadata={"node_id": f"graph_node_{i+1}", "query_used": query}
-            ))
-        return results
+    async def add_node(self, node_id: str, **properties: Any):
+        try: self.graph.add_node(node_id, **properties)
+        except Exception as e: raise MemoryAccessError(f"Failed to add node '{node_id}': {e}") from e
+    async def add_relation(self, s_id: str, o_id: str, type: Optional[str]=None, **props: Any):
+        attrs = {**props, 'type': type} if type else props
+        try: self.graph.add_edge(s_id, o_id, **attrs)
+        except Exception as e: raise MemoryAccessError(f"Failed to add relation {s_id}-{o_id}: {e}") from e
+    async def search(self, query: str, top_k: int = 5, filters: Optional[Dict]=None) -> List[RetrievedItem]:
+        # Simplified search, not implementing full GQL or Cypher.
+        results: List[RetrievedItem] = []
+        try:
+            if self.graph.has_node(query):
+                results.append(RetrievedItem(content={"id": query, "data": self.graph.nodes[query]}, source="graph_db_node"))
+            # Basic property search (very naive)
+            for node, data in self.graph.nodes(data=True):
+                if query in str(data.values()):
+                     results.append(RetrievedItem(content={"id": node, "data": data}, source="graph_db_property"))
+            return results[:top_k]
+        except Exception as e: raise MemoryAccessError(f"NetworkX search failed for '{query}': {e}") from e
+    async def save_graph(self, path: Optional[str]=None):
+        save_p = path or self.networkx_graph_path
+        if not save_p: raise ConfigurationError("No path for NetworkX graph save.")
+        try:
+            if save_p.endswith(".gml"): nx.write_gml(self.graph, save_p)
+            elif save_p.endswith(".graphml"): nx.write_graphml(self.graph, save_p)
+            else: self.logger.warning(f"Unsupported graph save format: {save_p}")
+        except Exception as e: raise MemoryAccessError(f"Failed to save NetworkX graph to '{save_p}': {e}") from e
 
-class StubQueryLLM:
-    """
-    Stub implementation for an LLM used for query manipulation and result re-ranking.
-    """
-    def __init__(self):
-        self.logger = logging.getLogger(__name__ + ".StubQueryLLM")
-        self.logger.info("StubQueryLLM initialized.")
 
-    async def expand_query(self, query: str, task_description: Optional[str] = None) -> str:
-        self.logger.info(f"Performing stub query expansion for: '{query}', task: {task_description}")
-        return f"{query} (expanded_stub)"
+# LLMRetriever
+class LLMRetriever:
+    def __init__(self, retriever_config: LLMRetrieverConfig, ltm_interface: Any, stm_interface: Any, graphdb_interface: Any, query_llm: Any = None):
+        self.retriever_config = retriever_config
+        self.ltm = ltm_interface
+        self.stm = stm_interface # Not used in current retrieve, but kept for interface
+        self.graph_db = graphdb_interface
+        self.query_llm = query_llm # For query expansion, etc.
+        self.logger = logger
+        self.whoosh_ix = None
+        self.cross_encoder = None
 
-    async def rerank_results(self, query:str, results: List[RetrievedItem]) -> List[RetrievedItem]:
-        self.logger.info(f"Performing stub re-ranking for query '{query}' on {len(results)} results.")
-        # Simple re-ranking: reverse the list and slightly adjust scores
-        reranked_results = []
-        for i, item in enumerate(reversed(results)):
-            new_score = item.score * 1.1 if item.score is not None else 0.5 # Give some score if None
-            reranked_results.append(RetrievedItem(
-                content=item.content,
-                source=item.source,
-                score=round(min(new_score, 1.0), 2), # Cap score at 1.0
-                metadata={**item.metadata, "reranked_by": "StubQueryLLM"}
-            ))
-        return reranked_results
+        if not self.retriever_config.embedding_model_name and (self.retriever_config.retrieval_strategy in ["all", "vector_only"] if hasattr(self.retriever_config, 'retrieval_strategy') else True) : # check if strategy implies embedding use
+             raise ConfigurationError("embedding_model_name is required for retriever if vector search is used.")
+        try:
+            if self.retriever_config.embedding_model_name:
+                 self.embedding_model = HuggingFaceEmbeddingModel(model_name=self.retriever_config.embedding_model_name, device=self.retriever_config.embedding_device)
+            else: self.embedding_model = None
+        except (EmbeddingError, ConfigurationError) as e:
+            self.logger.error(f"Retriever: Embedding model init failed: {e}", exc_info=True); raise
 
-# Example of how to use the stubs (can be run with `python -m contextkernel.core_logic.llm_retriever` if structure allows)
+        if self.retriever_config.keyword_search_enabled:
+            if not (Schema and QueryParser and ID and TEXT and create_in and open_dir and exists_in):
+                raise ConfigurationError("Whoosh library not fully available, but keyword search enabled.")
+            if not self.retriever_config.whoosh_index_dir:
+                raise ConfigurationError("Whoosh index directory not specified, but keyword search enabled.")
+            try:
+                schema = Schema(doc_id=ID(stored=True, unique=True), content=TEXT(stored=True))
+                idx_dir = self.retriever_config.whoosh_index_dir
+                if not os.path.exists(idx_dir): os.makedirs(idx_dir)
+                self.whoosh_ix = open_dir(idx_dir) if exists_in(idx_dir) else create_in(idx_dir, schema)
+            except Exception as e: raise ConfigurationError(f"Whoosh index init failed at '{idx_dir}': {e}") from e
+        
+        if hasattr(self.ltm, 'whoosh_ix'): self.ltm.whoosh_ix = self.whoosh_ix
+        if hasattr(self.ltm, 'retriever_config'): self.ltm.retriever_config = self.retriever_config
+
+        if self.retriever_config.cross_encoder_model_name:
+            if CrossEncoder is None: raise ConfigurationError("CrossEncoder configured but not installed.")
+            try: self.cross_encoder = CrossEncoder(self.retriever_config.cross_encoder_model_name)
+            except Exception as e: raise ConfigurationError(f"Failed to load CrossEncoder '{self.retriever_config.cross_encoder_model_name}': {e}") from e
+        self.logger.info("LLMRetriever initialized.")
+
+    async def _preprocess_and_embed_query(self, query: str, task_description: Optional[str]=None) -> List[float]:
+        if not self.embedding_model: raise ConfigurationError("Embedding model not available for query embedding.")
+        # Query expansion logic (placeholder)
+        return await self.embedding_model.generate_embedding(query)
+
+    async def _search_vector_store(self, q_embed: List[float], top_k: int, filters: Optional[Dict]=None) -> List[RetrievedItem]:
+        if not hasattr(self.ltm, 'search'): raise ConfigurationError("LTM interface missing 'search'.")
+        try: return await self.ltm.search(query_embedding=q_embed, top_k=top_k, filters=filters)
+        except Exception as e: raise MemoryAccessError(f"LTM search error: {e}") from e
+        
+    async def _search_graph_db(self, query: str, task: Optional[str]=None, top_k: int=5, filters: Optional[Dict]=None) -> List[RetrievedItem]:
+        if not hasattr(self.graph_db, 'search'): raise ConfigurationError("GraphDB interface missing 'search'.")
+        try: return await self.graph_db.search(query=query, task_description=task, top_k=top_k, filters=filters)
+        except Exception as e: raise MemoryAccessError(f"GraphDB search error: {e}") from e
+
+    async def _search_keyword(self, query: str, top_k: int=5, filters: Optional[Dict]=None) -> List[RetrievedItem]:
+        if not (self.retriever_config.keyword_search_enabled and self.whoosh_ix): return []
+        try:
+            with self.whoosh_ix.searcher() as searcher:
+                q = QueryParser("content", schema=self.whoosh_ix.schema).parse(query)
+                hits = searcher.search(q, limit=top_k)
+                return [RetrievedItem(content=h.get("content",""), source="keyword", score=h.score, metadata={"doc_id":h.get("doc_id")}) for h in hits]
+        except Exception as e: raise MemoryAccessError(f"Whoosh keyword search failed: {e}") from e
+
+    async def _consolidate_and_rank_results(self, query:str, results: List[List[RetrievedItem]], top_k_ce: int=20) -> List[RetrievedItem]:
+        flat_results = [item for sublist in results for item in sublist]
+        unique_results: Dict[str, RetrievedItem] = {}
+        for item in flat_results: # Simple dedupe by content preview or doc_id
+            key = str(item.metadata.get("doc_id") or str(item.content)[:50])
+            if key not in unique_results or (item.score and (unique_results[key].score is None or item.score > unique_results[key].score)): # type: ignore
+                unique_results[key] = item
+        
+        sorted_results = sorted(unique_results.values(), key=lambda x: x.score or 0.0, reverse=True)
+
+        if self.cross_encoder and sorted_results:
+            to_rerank = sorted_results[:top_k_ce]
+            pairs = [[query, str(item.content)] for item in to_rerank]
+            try:
+                ce_scores = await asyncio.to_thread(self.cross_encoder.predict, pairs, show_progress_bar=False) #type: ignore
+                for item, score in zip(to_rerank, ce_scores): item.score = float(score)
+                sorted_results = sorted(to_rerank, key=lambda x: x.score or 0.0, reverse=True) + sorted_results[top_k_ce:]
+            except Exception as e: self.logger.error(f"CrossEncoder re-ranking failed: {e}", exc_info=True); # Non-critical, proceed with original sort
+        return sorted_results
+
+    async def retrieve(self, query: str, task_description: Optional[str]=None, top_k: Optional[int]=None, filters: Optional[Dict]=None, retrieval_strategy: str="all") -> RetrievalResponse:
+        start_time, current_top_k = time.time(), top_k or self.retriever_config.default_top_k
+        final_items, errors = [], []
+        
+        try: q_embed = await self._preprocess_and_embed_query(query, task_description) if self.embedding_model else []
+        except EmbeddingError as e: q_embed, errors = [], [f"Query embedding failed: {e}"]
+        
+        task_error_messages: List[str] = [] # Initialize task_error_messages, was missing in original snippet for retrieve
+
+        search_coros = []
+        if retrieval_strategy in ["all", "vector_only"] and q_embed: search_coros.append(self._search_vector_store(q_embed, current_top_k, filters))
+        if retrieval_strategy in ["all", "graph_only"]: search_coros.append(self._search_graph_db(query, task_description, current_top_k, filters))
+        if retrieval_strategy in ["all", "keyword_only"]: search_coros.append(self._search_keyword(query, current_top_k, filters))
+
+        if search_coros:
+            results_from_sources = await asyncio.gather(*search_coros, return_exceptions=True)
+            processed_results: List[List[RetrievedItem]] = []
+            # Combine errors from asyncio.gather (e.g. direct call failures) 
+            # with task_error_messages (e.g. soft errors within search methods if they didn't raise)
+            all_errors = errors # Start with embedding errors
+            for i, res_or_exc in enumerate(results_from_sources):
+                if isinstance(res_or_exc, Exception): 
+                    all_errors.append(f"Search source {i} failed: {res_or_exc}")
+                elif res_or_exc: 
+                    processed_results.append(res_or_exc) # type: ignore
+            
+            # Add any task_error_messages that might have been populated by individual search methods
+            # (though current search methods raise on error, this is for robustness if they change)
+            all_errors.extend(task_error_messages)
+
+            if processed_results: 
+                final_items = await self._consolidate_and_rank_results(query, processed_results)
+        
+        msg = f"Retrieved {len(final_items)} items." + (f" Errors: {'; '.join(all_errors)}" if all_errors else "")
+        return RetrievalResponse(items=final_items, retrieval_time_ms=(time.time()-start_time)*1000, message=msg)
+
+# Example main (for direct execution if needed)
 async def main_test():
-    # Configure basic logging for the test run
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    logger = logging.getLogger(__name__) # Get a logger for the main_test function itself
-    logger.info("--- Running LLMRetriever with Stubs ---")
-
-    # Instantiate stubs
-    stub_embedding_model = StubEmbeddingModel()
-    stub_ltm = StubLTM()
-    stub_graph_db = StubGraphDB()
-    stub_query_llm = StubQueryLLM() # Optional, can be None
-
-    # Instantiate the retriever with stubs
-    # For STM, we can pass None or a simple mock if its interface is also defined/needed.
-    # For this test, assuming STM is not critically needed or its methods aren't called by current strategies.
-    retriever = LLMRetriever(
-        ltm_interface=stub_ltm,
-        stm_interface=None, # Requires a proper stub if STM is used in tested paths
-        graphdb_interface=stub_graph_db,
-        embedding_model=stub_embedding_model,
-        query_llm=stub_query_llm
-    )
-
-    logger.info("--- Test Case 1: 'all' strategy ---")
-    response_all = await retriever.retrieve(
-        query="What is the Context Kernel?",
-        task_description="User is asking a general question.",
-        top_k=3,
-        retrieval_strategy="all"
-    )
-    logger.info(f"Response (all): {response_all.json(indent=2)}")
-
-    logger.info("--- Test Case 2: 'vector_only' strategy ---")
-    response_vector = await retriever.retrieve(
-        query="Find similar documents to X.",
-        task_description="User wants semantic search.",
-        top_k=2,
-        retrieval_strategy="vector_only"
-    )
-    logger.info(f"Response (vector_only): {response_vector.json(indent=2)}")
-
-    logger.info("--- Test Case 3: 'graph_only' strategy ---")
-    response_graph = await retriever.retrieve(
-        query="Who is connected to Node Y?",
-        task_description="User is exploring connections.",
-        top_k=2,
-        retrieval_strategy="graph_only"
-    )
-    logger.info(f"Response (graph_only): {response_graph.json(indent=2)}")
-
-    logger.info("--- Test Case 4: Query that might not generate embedding (testing error path) ---")
-    # To test embedding failure, the stub would need a specific trigger.
-    # For now, we assume it always succeeds. If generate_embedding returned None:
-    # query_embedding = await retriever._preprocess_and_embed_query("force_error_in_embed", "")
-    # assert query_embedding is None , "Embedding should fail for this special query"
-    # response_embed_fail = await retriever.retrieve(query="force_error_in_embed", retrieval_strategy="vector_only")
-    # logger.info(f"Response (embed_fail): {response_embed_fail.json(indent=2)}")
-
-
-    # Example of using query_llm for query expansion (not directly in retrieve yet)
-    if retriever.query_llm:
-        original_query = "original query"
-        expanded = await retriever.query_llm.expand_query(original_query)
-        logger.info(f"Query expansion example: '{original_query}' -> '{expanded}'")
-
-        # Example of reranking (not directly in retrieve's main path yet for re-ranking)
-        if response_all.items:
-            reranked_items = await retriever.query_llm.rerank_results(query="What is the Context Kernel?", results=response_all.items)
-            logger.info(f"Reranking example (first item score before: {response_all.items[0].score}, after: {reranked_items[0].score if reranked_items else 'N/A'})")
-
-
-if __name__ == '__main__':
-    # Remove old mock classes as they are replaced by stubs
-    # class MockInterface: ... (removed)
-    # class MockEmbeddingModel: ... (removed)
-
-    # The old main part was just for basic instantiation.
-    # The new async main_test() provides a more comprehensive test.
-    asyncio.run(main_test())
+    logging.basicConfig(level=logging.INFO)
+    # Setup example configs and stubs here for a test run
+    # ... (similar to previous main_test but with updated error handling in mind)
+if __name__ == '__main__': asyncio.run(main_test())

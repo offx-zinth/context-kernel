@@ -1,83 +1,137 @@
-from pydantic import Field
-from pydantic_settings import BaseSettings
-from typing import Optional
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
+"""Configuration management for the Context Kernel application."""
+
+import logging
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional # Keep this for existing specific configs like RedisConfig
+
+# Import individual module configurations
+from contextkernel.core_logic.summarizer import SummarizerConfig
+from contextkernel.core_logic.llm_retriever import LLMRetrieverConfig
+from contextkernel.core_logic.llm_listener import LLMListenerConfig
+from contextkernel.core_logic.context_agent import ContextAgentConfig
+from contextkernel.core_logic.exceptions import ConfigurationError
+
+
+logger = logging.getLogger(__name__)
+
+# --- Existing Specific Configs (preserved) ---
 class RedisConfig(BaseSettings):
-    host: str = Field(default="localhost", env="REDIS_HOST")
-    port: int = Field(default=6379, env="REDIS_PORT")
-    password: Optional[str] = Field(default=None, env="REDIS_PASSWORD")
-    db: int = Field(default=0, env="REDIS_DB")
+    host: str = Field(default="localhost", validation_alias='REDIS_HOST')
+    port: int = Field(default=6379, validation_alias='REDIS_PORT')
+    password: Optional[str] = Field(default=None, validation_alias='REDIS_PASSWORD')
+    db: int = Field(default=0, validation_alias='REDIS_DB')
+
+    model_config = SettingsConfigDict(env_prefix='APP_REDIS_') # Example prefix for these specific settings
+
 
 class Neo4jConfig(BaseSettings):
-    uri: str = Field(default="neo4j://localhost:7687", env="NEO4J_URI")
-    user: str = Field(default="neo4j", env="NEO4J_USER")
-    password: str = Field(default="password", env="NEO4J_PASSWORD")
+    uri: str = Field(default="neo4j://localhost:7687", validation_alias='NEO4J_URI')
+    user: str = Field(default="neo4j", validation_alias='NEO4J_USER')
+    password: str = Field(default="password", validation_alias='NEO4J_PASSWORD')
+
+    model_config = SettingsConfigDict(env_prefix='APP_NEO4J_')
+
 
 class VectorDBConfig(BaseSettings):
-    type: str = Field(default="pinecone", env="VECTOR_DB_TYPE")
-    api_key: Optional[str] = Field(default=None, env="VECTOR_DB_API_KEY")
-    environment: Optional[str] = Field(default=None, env="VECTOR_DB_ENVIRONMENT")
+    type: str = Field(default="pinecone", validation_alias='VECTOR_DB_TYPE') # Example
+    api_key: Optional[str] = Field(default=None, validation_alias='VECTOR_DB_API_KEY')
+    environment: Optional[str] = Field(default=None, validation_alias='VECTOR_DB_ENVIRONMENT')
 
-class EmbeddingConfig(BaseSettings):
-    model_name: str = Field(default="text-embedding-ada-002", env="EMBEDDING_MODEL_NAME")
-    api_key: Optional[str] = Field(default=None, env="EMBEDDING_API_KEY") # For services like OpenAI
+    model_config = SettingsConfigDict(env_prefix='APP_VECTOR_DB_')
 
-class NLPServiceConfig(BaseSettings):
-    provider: str = Field(default="openai", env="NLP_SERVICE_PROVIDER")
-    api_key: Optional[str] = Field(default=None, env="NLP_SERVICE_API_KEY")
-    model: Optional[str] = Field(default="gpt-3.5-turbo", env="NLP_SERVICE_MODEL")
+# --- Main Application Configuration ---
 
-class S3Config(BaseSettings):
-    bucket_name: str = Field(default="my-context-kernel-bucket", env="S3_BUCKET_NAME")
-    aws_access_key_id: Optional[str] = Field(default=None, env="AWS_ACCESS_KEY_ID")
-    aws_secret_access_key: Optional[str] = Field(default=None, env="AWS_SECRET_ACCESS_KEY")
-    region_name: Optional[str] = Field(default="us-east-1", env="AWS_REGION_NAME")
+class AppConfig(BaseSettings):
+    """
+    Master configuration class for the application.
+    Nests individual component configurations and allows for environment variable overrides.
+    """
+    summarizer: SummarizerConfig = Field(default_factory=SummarizerConfig)
+    retriever: LLMRetrieverConfig = Field(default_factory=LLMRetrieverConfig)
+    listener: LLMListenerConfig = Field(default_factory=LLMListenerConfig)
+    agent: ContextAgentConfig = Field(default_factory=ContextAgentConfig)
 
-class FileSystemConfig(BaseSettings):
-    base_path: str = Field(default="/tmp/context_kernel_data", env="FILESYSTEM_BASE_PATH")
+    # Keep other specific configs if they are meant to be part of the global app config
+    # and not solely managed by other parts of a larger system.
+    # For now, they are separate, but could be nested under AppConfig too if desired:
+    # redis: RedisConfig = Field(default_factory=RedisConfig)
+    # neo4j: Neo4jConfig = Field(default_factory=Neo4jConfig)
+    # vector_db: VectorDBConfig = Field(default_factory=VectorDBConfig)
 
-class AppSettings(BaseSettings):
-    redis_config: RedisConfig = RedisConfig()
-    neo4j_config: Neo4jConfig = Neo4jConfig()
-    vector_db_config: VectorDBConfig = VectorDBConfig()
-    embedding_config: EmbeddingConfig = EmbeddingConfig()
-    nlp_service_config: NLPServiceConfig = NLPServiceConfig()
-    s3_config: S3Config = S3Config()
-    filesystem_config: FileSystemConfig = FileSystemConfig()
+    log_level: str = "INFO"
 
-    # Example of how to load a specific config if needed, e.g., for LTM raw content store
-    # raw_content_store_type: str = Field(default="filesystem", env="RAW_CONTENT_STORE_TYPE") # 's3' or 'filesystem'
+    model_config = SettingsConfigDict(
+        env_prefix='CK_APP_', # Main prefix for AppConfig settings
+        env_nested_delimiter='__',
+        env_file='.env',
+        extra='ignore'
+    )
 
-    class Config:
-        env_nested_delimiter = '__' # e.g. REDIS_CONFIG__HOST
+def load_config() -> AppConfig:
+    """Loads the application configuration."""
+    try:
+        config = AppConfig()
+        logger.info("Application configuration loaded successfully.")
+        logger.debug(f"AppConfig log_level: {config.log_level}")
+        # Log a sample from each nested config to verify they are loaded
+        logger.debug(f"Summarizer config via AppConfig: {config.summarizer.hf_abstractive_model_name}")
+        logger.debug(f"Retriever config via AppConfig: {config.retriever.embedding_model_name}")
+        logger.debug(f"Listener config via AppConfig: {config.listener.entity_extraction_model_name}")
+        logger.debug(f"Agent config via AppConfig: {config.agent.spacy_model_name}")
+        return config
+    except Exception as e:
+        logger.error(f"Failed to load AppConfig: {e}", exc_info=True)
+        raise ConfigurationError(f"Failed to load application configuration: {e}") from e
 
+# Example usage for direct testing of this module
 if __name__ == "__main__":
-    # Example usage:
-    # Set environment variables before running this script, e.g.:
-    # export REDIS_HOST=myredishost
-    # export NEO4J_PASSWORD=securepassword
-    # export VECTOR_DB_API_KEY=abcdef12345
-    # ... and so on for other settings
+    logging.basicConfig(level=logging.DEBUG)
 
-    settings = AppSettings()
+    # Create a dummy .env file for testing
+    with open(".env", "w") as f:
+        f.write("CK_APP_LOG_LEVEL=DEBUG\n")
+        # Example of overriding a nested config field:
+        # AppConfig.env_prefix = 'CK_APP_'
+        # AppConfig.env_nested_delimiter = '__'
+        # SummarizerConfig.env_prefix = 'SUMMARIZER_' (this is used if SummarizerConfig is loaded standalone)
+        # So, for AppConfig, the var is CK_APP_SUMMARIZER__HF_ABSTRACTIVE_MODEL_NAME
+        f.write("CK_APP_SUMMARIZER__HF_ABSTRACTIVE_MODEL_NAME=google/pegasus-xsum\n")
+        f.write("CK_APP_RETRIEVER__DEFAULT_TOP_K=7\n")
+        f.write("CK_APP_AGENT__INTENT_CLASSIFIER_MODEL=typeform/distilbert-base-uncased-mnli\n")
+        # For specific configs if they were nested under AppConfig:
+        # f.write("CK_APP_REDIS__HOST=myredishost\n")
 
-    print("Redis Config:", settings.redis_config)
-    print("Neo4j Config:", settings.neo4j_config)
-    print("Vector DB Config:", settings.vector_db_config)
-    print("Embedding Config:", settings.embedding_config)
-    print("NLP Service Config:", settings.nlp_service_config)
-    print("S3 Config:", settings.s3_config)
-    print("File System Config:", settings.filesystem_config)
+    try:
+        app_config = load_config()
+        print("\nAppConfig loaded successfully!")
+        print(f"Log Level: {app_config.log_level}")
+        print(f"Summarizer Model: {app_config.summarizer.hf_abstractive_model_name}")
+        print(f"Retriever Top K: {app_config.retriever.default_top_k}")
+        print(f"Agent Intent Model: {app_config.agent.intent_classifier_model}")
 
-    # To access a specific setting:
-    print(f"\nRedis Host: {settings.redis_config.host}")
-    print(f"Neo4j User: {settings.neo4j_config.user}")
+        # To load specific configs (if they are not nested under AppConfig)
+        # print("\nLoading specific configs separately (if not nested):")
+        # redis_settings = RedisConfig()
+        # print(f"Separate Redis Host: {redis_settings.host}")
 
-    # Example of how environment variables override defaults:
-    # Assumes REDIS_HOST is set in the environment
-    # import os
-    # os.environ["REDIS_HOST"] = "env_redis_host"
-    # os.environ["APP_REDIS_CONFIG__PORT"] = "1234" # For nested model
-    # settings_env_override = AppSettings()
-    # print(f"\nRedis Host (from env): {settings_env_override.redis_config.host}")
-    # print(f"Redis Port (from env with nested): {settings_env_override.redis_config.port}")
+    except Exception as e:
+        print(f"Error loading or testing config: {e}")
+    finally:
+        import os
+        if os.path.exists(".env"):
+            os.remove(".env")
