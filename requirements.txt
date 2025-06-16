@@ -2,7 +2,6 @@
 transformers
 torch
 spacy
-sentence-transformers
 # Faiss for vector similarity search (optional, can be added later)
 # faiss-cpu
 # networkx for graph operations
