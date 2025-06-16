@@ -63,6 +63,9 @@ class LTM:
 
         # Configuration shortcuts
         self._faiss_index_path: Optional[str] = self.vector_db_config.params.get("index_path") if self.vector_db_config.params else None
+        self._faiss_metadata_path: Optional[str] = None
+        if self._faiss_index_path:
+            self._faiss_metadata_path = self._faiss_index_path + ".metadata.json"
         self._raw_store_base_path: Optional[str] = None # Set in boot() if FileSystemConfig
 
         # Ensure vector_db_config.params exists if we expect "dimension" later, or handle its absence.
@@ -116,10 +119,49 @@ class LTM:
                 if self.faiss_index.d != self.embedding_dimension:
                     logger.error(f"Loaded FAISS index dimension ({self.faiss_index.d}) does not match model dimension ({self.embedding_dimension}).")
                     raise ValueError("Loaded FAISS index dimension mismatch.")
-                # TODO: Load mappings and metadata persistence here.
+                # Load metadata
+                if self._faiss_metadata_path and os.path.exists(self._faiss_metadata_path):
+                    try:
+                        with open(self._faiss_metadata_path, 'r', encoding='utf-8') as f:
+                            metadata_content = f.read()
+                            if not metadata_content.strip(): # File is empty
+                                logger.warning(f"FAISS metadata file {self._faiss_metadata_path} is empty.")
+                                if self.faiss_index.ntotal > 0:
+                                    logger.error("FAISS index has data but metadata file is empty. This is a critical error.")
+                                    raise ValueError("FAISS index has data but metadata is empty.")
+                                # else, it's okay, start fresh
+                            else:
+                                loaded_metadata = json.loads(metadata_content)
+                                self.faiss_id_to_memory_id = {int(k): v for k, v in loaded_metadata.get("faiss_id_to_memory_id", {}).items()}
+                                self.memory_id_to_faiss_id = loaded_metadata.get("memory_id_to_faiss_id", {})
+                                self.memory_id_metadata = loaded_metadata.get("memory_id_metadata", {})
+                                logger.info(f"Loaded FAISS metadata from {self._faiss_metadata_path}. "
+                                            f"Mappings: {len(self.faiss_id_to_memory_id)} faiss_ids, "
+                                            f"{len(self.memory_id_to_faiss_id)} memory_ids.")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Error decoding JSON from FAISS metadata file {self._faiss_metadata_path}: {e}")
+                        if self.faiss_index.ntotal > 0:
+                            logger.error("FAISS index has data but metadata file is corrupt. This is a critical error.")
+                            raise ValueError("FAISS index has data but metadata is corrupt.")
+                        # else, start fresh if index is also empty/new
+                    except Exception as e:
+                        logger.error(f"Error loading FAISS metadata from {self._faiss_metadata_path}: {e}", exc_info=True)
+                        if self.faiss_index.ntotal > 0:
+                            logger.error("FAISS index has data but metadata loading failed. This is a critical error.")
+                            raise # Re-raise for critical failures
+                        # else, start fresh
+                else:
+                    logger.info("No FAISS metadata file found. Starting with empty mappings.")
+                    self.faiss_id_to_memory_id = {}
+                    self.memory_id_to_faiss_id = {}
+                    self.memory_id_metadata = {}
             else:
                 logger.info(f"FAISS index not found at {self._faiss_index_path} or path not configured. Creating new index.")
                 self.faiss_index = faiss.IndexFlatL2(self.embedding_dimension)
+                # New index means new empty mappings
+                self.faiss_id_to_memory_id = {}
+                self.memory_id_to_faiss_id = {}
+                self.memory_id_metadata = {}
                 logger.info(f"New FAISS index (IndexFlatL2) created with dimension {self.embedding_dimension}.")
 
             # 4. Setup Raw Content Store (FileSystem specific)
@@ -160,9 +202,47 @@ class LTM:
                     logger.info(f"Saving FAISS index with {self.faiss_index.ntotal} vectors to {self._faiss_index_path}...")
                     faiss.write_index(self.faiss_index, self._faiss_index_path)
                     logger.info("FAISS index saved.")
-                    # TODO: Persist self.faiss_id_to_memory_id and self.memory_id_metadata
+
+                    # Save metadata
+                    if self._faiss_metadata_path:
+                        metadata_to_save = {
+                            "faiss_id_to_memory_id": self.faiss_id_to_memory_id,
+                            "memory_id_to_faiss_id": self.memory_id_to_faiss_id,
+                            "memory_id_metadata": self.memory_id_metadata
+                        }
+                        temp_metadata_path = self._faiss_metadata_path + ".tmp"
+                        try:
+                            with open(temp_metadata_path, 'w', encoding='utf-8') as f:
+                                json.dump(metadata_to_save, f, indent=4)
+                            os.replace(temp_metadata_path, self._faiss_metadata_path) # Atomic rename
+                            logger.info(f"FAISS metadata saved to {self._faiss_metadata_path}")
+                        except IOError as e:
+                            logger.error(f"Error saving FAISS metadata to {self._faiss_metadata_path}: {e}", exc_info=True)
+                            if os.path.exists(temp_metadata_path):
+                                try:
+                                    os.remove(temp_metadata_path)
+                                except OSError as ose:
+                                    logger.error(f"Error deleting temporary metadata file {temp_metadata_path}: {ose}")
+                        except Exception as e: # Catch other potential errors like json.dumps issues
+                            logger.error(f"Unexpected error saving FAISS metadata: {e}", exc_info=True)
+                            if os.path.exists(temp_metadata_path):
+                                try:
+                                    os.remove(temp_metadata_path)
+                                except OSError as ose:
+                                    logger.error(f"Error deleting temporary metadata file {temp_metadata_path} after unexpected error: {ose}")
+                    else:
+                        logger.warning("FAISS metadata path not configured. Metadata not saved.")
                 else:
-                    logger.info("FAISS index is empty. Not saving to disk.")
+                    logger.info("FAISS index is empty. Not saving index to disk.")
+                    # If index is empty, try to delete existing metadata file for consistency
+                    if self._faiss_metadata_path and os.path.exists(self._faiss_metadata_path):
+                        try:
+                            os.remove(self._faiss_metadata_path)
+                            logger.info(f"Deleted existing FAISS metadata file {self._faiss_metadata_path} as index is empty.")
+                        except OSError as e:
+                            logger.error(f"Error deleting FAISS metadata file {self._faiss_metadata_path}: {e}", exc_info=True)
+                    else:
+                        logger.info("No metadata file to delete or path not configured.")
             except Exception as e:
                 logger.error(f"Error saving FAISS index to {self._faiss_index_path}: {e}", exc_info=True)
 
@@ -474,10 +554,10 @@ class LTM:
 
 
 async def main():
-import tempfile # For creating temporary directories for the example
-import shutil # For cleaning up temporary directories
+    import tempfile # For creating temporary directories for the example
+    import shutil # For cleaning up temporary directories
 
-async def main():
+# async def main(): # This was a duplicated main() definition
     if not logger.handlers:
         # Set logging level to DEBUG for more detailed output from LTM and other components
         logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -499,161 +579,146 @@ async def main():
     raw_store_conf = FileSystemConfig(base_path=raw_content_path)
     embed_conf = EmbeddingConfig(model_name='all-MiniLM-L6-v2') # This model has 384 dimensions
 
-    redis_conf_for_cache = RedisConfig(db=1)
+    # Simplified RawCache for this example - does not connect to Redis
+    # In a real scenario, you would use a proper RawCache setup as before
+    class MockEmbeddingCache(RawCache):
+        def __init__(self):
+            self._cache = {}
+        async def boot(self): return True
+        async def shutdown(self): self._cache.clear(); return True
+        async def get(self, key: str, namespace: Optional[str] = None) -> Optional[Any]:
+            return self._cache.get(f"{namespace}:{key}" if namespace else key)
+        async def set(self, key: str, value: Any, namespace: Optional[str] = None, ttl_seconds: Optional[int] = None):
+            self._cache[f"{namespace}:{key}" if namespace else key] = value
+        async def delete(self, key: str, namespace: Optional[str] = None):
+            self._cache.pop(f"{namespace}:{key}" if namespace else key, None)
 
-    # Real RawCache for embedding caching
-    redis_client_for_cache = None
-    try:
-        redis_client_for_cache = RedisClient(
-            host=redis_conf_for_cache.host,
-            port=redis_conf_for_cache.port,
-            db=redis_conf_for_cache.db,
-            password=redis_conf_for_cache.password,
-            socket_timeout=5,
-            socket_connect_timeout=5
-        )
-        await redis_client_for_cache.ping()
-        logger.info("Successfully connected to Redis for LTM's embedding cache.")
-    except Exception as e:
-        logger.error(f"Could not connect to Redis for LTM's cache: {e}. This example needs Redis to run.", exc_info=True)
-        shutil.rmtree(temp_dir)
-        logger.info(f"Cleaned up temporary directory: {temp_dir}")
-        return
+    embedding_cache_instance = MockEmbeddingCache()
 
-    embedding_cache_instance = RawCache(config=redis_conf_for_cache, client=redis_client_for_cache)
 
-    # Instantiate LTM with real integrations
-    ltm_system = LTM(
+    # --- First Run: Store data ---
+    logger.info("--- LTM First Run: Storing data ---")
+    ltm_system_run1 = LTM(
         vector_db_config=vec_db_conf,
         raw_content_store_config=raw_store_conf,
         embedding_config=embed_conf,
         embedding_cache=embedding_cache_instance
     )
 
-    if not await ltm_system.boot(): # Loads models, FAISS index, creates dirs
-        logger.error("LTM boot failed. Exiting example.")
-        await redis_client_for_cache.close()
+    if not await ltm_system_run1.boot():
+        logger.error("LTM Run 1 boot failed. Exiting example.")
         shutil.rmtree(temp_dir)
-        logger.info(f"Cleaned up temporary directory: {temp_dir}")
         return
 
+    mem_id1_run1, mem_id2_run1, mem_id3_run1 = None, None, None
+    query_emb_run1 = None
+
     try:
-        # --- Test LTM operations ---
         text1 = "The quick brown fox jumps over the lazy dog."
         meta1 = {"source": "test_doc_1", "chapter": 1, "tags": ["animal", "classic"]}
-
-        logger.info(f"Generating embedding for: '{text1}'")
-        emb1 = await ltm_system.generate_embedding(text1)
-        assert len(emb1) == ltm_system.embedding_dimension, f"Embedding dimension mismatch. Expected {ltm_system.embedding_dimension}, got {len(emb1)}"
-        logger.info(f"Generated embedding preview: {emb1[:5]}...")
-
-        # Check if embedding was cached
-        text1_cache_key = f"embedding:{ltm_system._get_text_key(text1)}"
-        cached_emb1_val = await embedding_cache_instance.get(text1_cache_key, namespace="ltm_embeddings")
-        assert cached_emb1_val is not None and isinstance(cached_emb1_val, list), "Embedding for text1 not found in cache or wrong type"
-        logger.info("Embedding for text1 found in RawCache after generation.")
+        emb1 = await ltm_system_run1.generate_embedding(text1)
 
         text2 = "Artificial intelligence is transforming various global sectors."
         meta2 = {"source": "research_paper_001", "year": 2023, "tags": ["AI", "technology", "global"]}
-        emb2 = await ltm_system.generate_embedding(text2)
+        emb2 = await ltm_system_run1.generate_embedding(text2)
 
         text3 = "Context Kernels provide a novel framework for AI memory management."
         meta3 = {"source": "blog_post_abc", "author": "Dr. AI", "tags": ["AI", "memory", "ContextKernel"]}
-        emb3 = await ltm_system.generate_embedding(text3)
+        emb3 = await ltm_system_run1.generate_embedding(text3)
 
-        logger.info("--- Storing memory chunks ---")
-        mem_id1 = await ltm_system.store_memory_chunk(chunk_id="fox_example", text_content=text1, embedding=emb1, metadata=meta1)
-        mem_id2 = await ltm_system.store_memory_chunk(chunk_id="ai_transform_example", text_content=text2, embedding=emb2, metadata=meta2)
-        mem_id3 = await ltm_system.store_memory_chunk(chunk_id="ck_def_example", text_content=text3, embedding=emb3, metadata=meta3)
-        logger.info(f"Stored memory IDs: {mem_id1}, {mem_id2}, {mem_id3}")
-        assert ltm_system.faiss_index.ntotal == 3, f"FAISS index should have 3 vectors, has {ltm_system.faiss_index.ntotal}"
+        mem_id1_run1 = await ltm_system_run1.store_memory_chunk(chunk_id="fox_example", text_content=text1, embedding=emb1, metadata=meta1)
+        mem_id2_run1 = await ltm_system_run1.store_memory_chunk(chunk_id="ai_transform_example", text_content=text2, embedding=emb2, metadata=meta2)
+        mem_id3_run1 = await ltm_system_run1.store_memory_chunk(chunk_id="ck_def_example", text_content=text3, embedding=emb3, metadata=meta3)
 
-        logger.info(f"--- Retrieving memory by ID: {mem_id1} ---")
-        retrieved_mem1 = await ltm_system.get_memory_by_id(mem_id1)
-        logger.info(f"Retrieved memory {mem_id1}: {json.dumps(retrieved_mem1, indent=2)}")
-        assert retrieved_mem1 is not None and retrieved_mem1["text_content"] == text1, "Failed to retrieve or content mismatch for mem_id1"
+        # Test with chunk_id = None
+        text4_anon = "An anonymous contribution to knowledge."
+        meta4_anon = {"source": "anonymous", "tags": ["uuid_test"]}
+        emb4_anon = await ltm_system_run1.generate_embedding(text4_anon)
+        mem_id4_anon = await ltm_system_run1.store_memory_chunk(chunk_id=None, text_content=text4_anon, embedding=emb4_anon, metadata=meta4_anon)
+        logger.info(f"Run 1: Stored memory IDs: {mem_id1_run1}, {mem_id2_run1}, {mem_id3_run1}, {mem_id4_anon} (UUID generated)")
+        assert "ltm_mem_" not in mem_id4_anon, f"Expected '{mem_id4_anon}' to be a raw UUID string."
+        assert ltm_system_run1.faiss_index.ntotal == 4, "Run 1: FAISS index should have 4 vectors after adding anonymous chunk"
 
-        logger.info(f"--- Retrieving relevant memories for query: 'AI memory framework' ---")
-        query_text = "AI memory framework"
-        query_emb = await ltm_system.generate_embedding(query_text)
 
-        relevant_memories = await ltm_system.retrieve_relevant_memories(query_embedding=query_emb, top_k=2)
-        logger.info(f"Relevant memories for '{query_text}':")
-        for mem in relevant_memories:
-            logger.info(f"  ID: {mem['memory_id']}, Score: {mem['score']:.4f}, Text='{mem['text_content'][:60]}...'")
-        assert len(relevant_memories) > 0, "Expected some relevant memories for 'AI memory framework'"
-        if relevant_memories:
-             assert relevant_memories[0]['memory_id'] == mem_id3, "Context Kernel definition not found as most relevant for 'AI memory framework'"
+        query_text_run1 = "AI memory framework"
+        query_emb_run1 = await ltm_system_run1.generate_embedding(query_text_run1)
 
-        logger.info(f"--- Retrieving relevant memories with metadata filter (tags='AI') ---")
-        relevant_memories_filtered = await ltm_system.retrieve_relevant_memories(
-            query_embedding=query_emb, top_k=2, metadata_filter={"tags": "AI"} # Filter for "AI" tag
-        )
-        logger.info(f"Filtered relevant memories (tags='AI') for '{query_text}':")
-        found_mem_id2 = False
-        found_mem_id3 = False
-        for mem in relevant_memories_filtered:
-            logger.info(f"  ID: {mem['memory_id']}, Score: {mem['score']:.4f}, Text='{mem['text_content'][:60]}...', Metadata: {mem['metadata']}")
-            assert "AI" in mem['metadata']['tags'], "Filtered memory does not contain 'AI' tag"
-            if mem['memory_id'] == mem_id2: found_mem_id2 = True
-            if mem['memory_id'] == mem_id3: found_mem_id3 = True
-        assert found_mem_id2 and found_mem_id3, "Expected to find mem_id2 and mem_id3 with 'AI' tag"
-        assert len(relevant_memories_filtered) == 2, "Expected 2 memories with 'AI' tag"
-
-        # Test update: Store same memory_id again, should update
-        logger.info(f"--- Testing update for memory_id: {mem_id1} ---")
-        updated_text1 = "The very quick brown fox jumps swiftly over the dog."
-        updated_emb1 = await ltm_system.generate_embedding(updated_text1) # New embedding for new text
-        updated_meta1 = {**meta1, "version": 2, "status": "updated"}
-        await ltm_system.store_memory_chunk(chunk_id="fox_example", text_content=updated_text1, embedding=updated_emb1, metadata=updated_meta1)
-
-        assert ltm_system.faiss_index.ntotal == 3, "FAISS index should still have 3 vectors after update."
-        retrieved_updated_mem1 = await ltm_system.get_memory_by_id(mem_id1)
-        assert retrieved_updated_mem1["text_content"] == updated_text1, "Text content not updated."
-        assert retrieved_updated_mem1["metadata"]["version"] == 2, "Metadata not updated."
-        logger.info(f"Memory {mem_id1} updated and verified.")
-
-        # Test FAISS persistence by shutting down and booting again
-        logger.info("--- Testing FAISS persistence ---")
-        await ltm_system.shutdown() # Saves index
-
-        # New LTM instance, should load from the saved index
-        ltm_system_rebooted = LTM(
-            vector_db_config=vec_db_conf,
-            raw_content_store_config=raw_store_conf,
-            embedding_config=embed_conf,
-            embedding_cache=embedding_cache_instance
-        )
-        assert await ltm_system_rebooted.boot(), "LTM failed to reboot"
-        assert ltm_system_rebooted.faiss_index is not None, "FAISS index not loaded on reboot"
-        assert ltm_system_rebooted.faiss_index.ntotal == 3, f"Rebooted FAISS index should have 3 vectors, found {ltm_system_rebooted.faiss_index.ntotal}"
-        logger.info("FAISS index loaded after reboot with correct number of vectors.")
-
-        # Perform a search with the rebooted LTM to ensure it's functional
-        relevant_rebooted = await ltm_system_rebooted.retrieve_relevant_memories(query_embedding=query_emb, top_k=1)
-        assert len(relevant_rebooted) == 1, "Search after reboot failed to return results."
-        assert relevant_rebooted[0]['memory_id'] == mem_id3, "Search after reboot returned incorrect top result."
-        logger.info("Search after reboot successful.")
-        # Actual shutdown for the rebooted instance
-        await ltm_system_rebooted.shutdown()
-
+        await ltm_system_run1.shutdown() # Saves index and metadata
+        logger.info("--- LTM First Run: Shutdown complete ---")
 
     except Exception as e:
-        logger.error(f"An error occurred during LTM example operations: {e}", exc_info=True)
+        logger.error(f"An error occurred during LTM Run 1: {e}", exc_info=True)
     finally:
-        # Shutdown LTM (saves FAISS index) and other components
-        logger.info("--- Shutting down LTM and other components (final) ---")
-        # Ensure original ltm_system is shutdown if it wasn't the one rebooted and potentially failed
-        if 'ltm_system_rebooted' not in locals() or ltm_system_rebooted is not ltm_system :
-             if ltm_system and ltm_system.faiss_index is not None : #Check if it was booted
-                await ltm_system.shutdown()
+        if ltm_system_run1 and ltm_system_run1.embedding_model: # Check if booted before trying to shut down
+            await ltm_system_run1.shutdown()
 
-        if embedding_cache_instance: # Shutdown cache if it was initialized
-            await embedding_cache_instance.shutdown()
-        if redis_client_for_cache: # Close redis client if it was initialized
-            await redis_client_for_cache.close()
 
-        # Clean up the temporary directory
+    # --- Second Run: Load persisted data and verify ---
+    logger.info("--- LTM Second Run: Loading persisted data ---")
+    ltm_system_run2 = LTM(
+        vector_db_config=vec_db_conf, # Same config, pointing to the same files
+        raw_content_store_config=raw_store_conf,
+        embedding_config=embed_conf,
+        embedding_cache=embedding_cache_instance # Can use a new or same cache for this test
+    )
+
+    if not await ltm_system_run2.boot():
+        logger.error("LTM Run 2 boot failed. Exiting example.")
+        shutil.rmtree(temp_dir)
+        return
+
+    try:
+        assert ltm_system_run2.faiss_index is not None, "Run 2: FAISS index not loaded"
+        assert ltm_system_run2.faiss_index.ntotal == 4, f"Run 2: FAISS index should have 4 vectors, found {ltm_system_run2.faiss_index.ntotal}"
+        logger.info("Run 2: FAISS index loaded with correct number of vectors.")
+
+        # Verify mappings were reloaded
+        assert len(ltm_system_run2.faiss_id_to_memory_id) == 4, "Run 2: faiss_id_to_memory_id mapping incorrect size"
+        assert len(ltm_system_run2.memory_id_to_faiss_id) == 4, "Run 2: memory_id_to_faiss_id mapping incorrect size"
+        assert len(ltm_system_run2.memory_id_metadata) == 4, "Run 2: memory_id_metadata mapping incorrect size"
+        logger.info("Run 2: Metadata mappings reloaded with correct sizes.")
+
+        # Verify retrieval of the anonymous chunk by its generated ID
+        logger.info(f"Run 2: Retrieving memory by ID: {mem_id4_anon} (UUID generated in Run 1)")
+        retrieved_mem4_anon_run2 = await ltm_system_run2.get_memory_by_id(mem_id4_anon)
+        assert retrieved_mem4_anon_run2 is not None, f"Run 2: Failed to retrieve {mem_id4_anon}"
+        assert retrieved_mem4_anon_run2["text_content"] == text4_anon, "Run 2: Content mismatch for retrieved anonymous chunk"
+        assert retrieved_mem4_anon_run2["metadata"]["source"] == "anonymous", "Run 2: Metadata mismatch for retrieved anonymous chunk"
+        logger.info(f"Run 2: Successfully retrieved and verified memory {mem_id4_anon} by ID.")
+
+        # Verify retrieval by ID for one of the memories stored in Run 1
+        logger.info(f"Run 2: Retrieving memory by ID: {mem_id1_run1}")
+        retrieved_mem1_run2 = await ltm_system_run2.get_memory_by_id(mem_id1_run1)
+        assert retrieved_mem1_run2 is not None, f"Run 2: Failed to retrieve {mem_id1_run1}"
+        assert retrieved_mem1_run2["text_content"] == "The quick brown fox jumps over the lazy dog.", "Run 2: Content mismatch for retrieved mem_id1"
+        assert retrieved_mem1_run2["metadata"]["source"] == "test_doc_1", "Run 2: Metadata mismatch for retrieved mem_id1"
+        logger.info(f"Run 2: Successfully retrieved and verified memory {mem_id1_run1} by ID.")
+
+        # Verify search functionality still works and returns expected results
+        logger.info(f"Run 2: Retrieving relevant memories for query: 'AI memory framework'")
+        # Use query_emb_run1 as it's for the same text and model
+        relevant_memories_run2 = await ltm_system_run2.retrieve_relevant_memories(query_embedding=query_emb_run1, top_k=1)
+        assert len(relevant_memories_run2) == 1, "Run 2: Search failed to return results."
+        assert relevant_memories_run2[0]['memory_id'] == mem_id3_run1, f"Run 2: Search returned incorrect top result. Expected {mem_id3_run1}, got {relevant_memories_run2[0]['memory_id']}"
+        logger.info("Run 2: Search successful with persisted data.")
+
+        # Verify metadata for a specific memory ID
+        specific_meta = ltm_system_run2.memory_id_metadata.get(mem_id2_run1)
+        assert specific_meta is not None, f"Run 2: Metadata for {mem_id2_run1} not found in reloaded mappings."
+        assert specific_meta["original_memory_id"] == mem_id2_run1, f"Run 2: original_memory_id mismatch for {mem_id2_run1}"
+        assert specific_meta["raw_content_id"] == f"raw_{mem_id2_run1}.json", f"Run 2: raw_content_id mismatch for {mem_id2_run1}"
+        assert ltm_system_run2.memory_id_to_faiss_id.get(mem_id2_run1) is not None, f"Run 2: FAISS ID for {mem_id2_run1} not found."
+        logger.info(f"Run 2: Verified specific metadata for {mem_id2_run1}.")
+
+
+        logger.info("--- LTM Second Run: All persistence tests passed ---")
+
+    except Exception as e:
+        logger.error(f"An error occurred during LTM Run 2 operations: {e}", exc_info=True)
+    finally:
+        if ltm_system_run2 and ltm_system_run2.embedding_model: # Check if booted
+            await ltm_system_run2.shutdown()
+        # Clean up the temporary directory (only once, after all runs)
         try:
             shutil.rmtree(temp_dir)
             logger.info(f"Cleaned up temporary directory: {temp_dir}")
@@ -662,8 +727,8 @@ async def main():
 
     logger.info("--- LTM Real Integration Example Usage Complete ---")
 
+
 if __name__ == "__main__":
-    # This example needs `sentence-transformers`, `faiss-cpu`, and `redis` to be installed.
-    # It also requires a running Redis instance for the RawCache.
-    # `pip install sentence-transformers faiss-cpu redis`
+    # This example needs `sentence-transformers`, `faiss-cpu`.
+    # `pip install sentence-transformers faiss-cpu`
     asyncio.run(main())

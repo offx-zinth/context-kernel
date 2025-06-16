@@ -56,19 +56,40 @@ class STM:
             "positive feedback", "negative feedback", "transactional"
         ]
 
+        # Configurable intent threshold
+        _configured_threshold = getattr(self.intent_tagging_nlp_config, 'intent_threshold', None)
+        if _configured_threshold is not None and 0.0 <= _configured_threshold <= 1.0:
+            self.intent_classification_threshold = _configured_threshold
+            logger.info(f"Using configured intent classification threshold: {self.intent_classification_threshold}")
+        else:
+            self.intent_classification_threshold = 0.7 # Default threshold
+            if _configured_threshold is not None: # Log if configured value was invalid
+                 logger.warning(f"Invalid intent_threshold ({_configured_threshold}) in config. Must be between 0.0 and 1.0. Using default: {self.intent_classification_threshold}")
+            else:
+                 logger.info(f"Intent classification threshold not configured. Using default: {self.intent_classification_threshold}")
+
+
         # Load summarization model and tokenizer
         _summarizer_model_name = self.summarizer_nlp_config.model or self.DEFAULT_SUMMARIZER_MODEL
         try:
             logger.info(f"Loading summarization model: {_summarizer_model_name}")
             self.summarizer_tokenizer = AutoTokenizer.from_pretrained(_summarizer_model_name)
             self.summarizer_model = AutoModelForSeq2SeqLM.from_pretrained(_summarizer_model_name)
-            logger.info("Summarization model and tokenizer loaded.")
+
+            # Device management for summarizer model
+            summarizer_device_name = getattr(self.summarizer_nlp_config, 'device', None)
+            if summarizer_device_name:
+                self.summarizer_device = torch.device(summarizer_device_name)
+            else:
+                self.summarizer_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.summarizer_model.to(self.summarizer_device)
+            logger.info(f"Summarization model '{_summarizer_model_name}' loaded on device '{self.summarizer_device}'.")
+
         except Exception as e:
-            logger.error(f"Error loading summarization model '{_summarizer_model_name}': {e}", exc_info=True)
-            # Fallback or raise - for now, log and continue, methods will fail if model is None
-            self.summarizer_tokenizer = None
-            self.summarizer_model = None
-            # Consider raising RuntimeError here if summarization is critical
+            logger.critical(f"CRITICAL: Failed to load summarization model '{_summarizer_model_name}'. Error: {e}", exc_info=True)
+            # self.summarizer_tokenizer = None # No need to set to None if raising
+            # self.summarizer_model = None
+            raise RuntimeError(f"Failed to load critical STM summarization model: {_summarizer_model_name}. STM cannot operate.") from e
 
         # Load intent tagging (zero-shot classification) model and tokenizer
         _intent_model_name = self.intent_tagging_nlp_config.model or self.DEFAULT_INTENT_MODEL
@@ -76,17 +97,25 @@ class STM:
             logger.info(f"Loading intent classification model: {_intent_model_name}")
             self.intent_tokenizer = AutoTokenizer.from_pretrained(_intent_model_name)
             self.intent_model = AutoModelForSequenceClassification.from_pretrained(_intent_model_name)
-            # For zero-shot, we can also use the pipeline for convenience
-            # self.intent_classifier_pipeline = pipeline("zero-shot-classification", model=_intent_model_name, tokenizer=_intent_model_name)
-            logger.info("Intent classification model and tokenizer loaded.")
+
+            # Device management for intent model
+            intent_device_name = getattr(self.intent_tagging_nlp_config, 'device', None)
+            if intent_device_name:
+                self.intent_device = torch.device(intent_device_name)
+            else:
+                self.intent_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.intent_model.to(self.intent_device)
+            logger.info(f"Intent classification model '{_intent_model_name}' loaded on device '{self.intent_device}'.")
+
         except Exception as e:
-            logger.error(f"Error loading intent model '{_intent_model_name}': {e}", exc_info=True)
-            self.intent_tokenizer = None
-            self.intent_model = None
-            # self.intent_classifier_pipeline = None
+            logger.critical(f"CRITICAL: Failed to load intent classification model '{_intent_model_name}'. Error: {e}", exc_info=True)
+            # self.intent_tokenizer = None
+            # self.intent_model = None
+            raise RuntimeError(f"Failed to load critical STM intent model: {_intent_model_name}. STM cannot operate.") from e
 
         self._conversations_stub: Dict[str, Deque[Dict[str, Any]]] = {}
-        logger.info(f"STM initialized. Summarizer: {_summarizer_model_name}, Intent Tagger: {_intent_model_name}, Max Turns: {self.max_turns}.")
+        # Initialized log assumes models are loaded due to raise on failure.
+        logger.info(f"STM initialized. Summarizer: {_summarizer_model_name} on {self.summarizer_device}, Intent Tagger: {_intent_model_name} on {self.intent_device}, Max Turns: {self.max_turns}.")
 
     async def boot(self):
         """
@@ -181,12 +210,11 @@ class STM:
             # Synchronous Hugging Face model inference needs to be run in an executor
             def _summarize_sync():
                 inputs = self.summarizer_tokenizer(text_to_summarize, return_tensors="pt", max_length=1024, truncation=True)
-                # Ensure model is on CPU if torch.cuda not available or not desired for this specific model
-                # device = "cuda" if torch.cuda.is_available() else "cpu"
-                # self.summarizer_model.to(device)
-                # inputs = inputs.to(device)
+                # Move tokenized inputs to the model's device
+                inputs = inputs.to(self.summarizer_device)
                 summary_ids = self.summarizer_model.generate(
                     inputs['input_ids'],
+                    attention_mask=inputs['attention_mask'], # Include attention mask
                     num_beams=4, # Example generation parameters
                     max_length=150, # Adjust as needed
                     early_stopping=True
@@ -202,7 +230,7 @@ class STM:
             return f"Error during summarization: {e}"
 
 
-    async def _extract_intents_hf(self, session_id: str, turns: List[Dict[str, Any]], threshold: float = 0.7) -> List[str]:
+    async def _extract_intents_hf(self, session_id: str, turns: List[Dict[str, Any]]) -> List[str]: # Removed threshold from params
         if not self.intent_model or not self.intent_tokenizer:
             logger.warning(f"Intent model/tokenizer not available for session '{session_id}'. Returning empty list.")
             return []
@@ -227,17 +255,17 @@ class STM:
 
             def _classify_sync():
                 inputs = self.intent_tokenizer(text_for_intent, self.candidate_intent_labels, return_tensors="pt", padding=True, truncation=True)
-                # device = "cuda" if torch.cuda.is_available() else "cpu"
-                # self.intent_model.to(device)
-                # inputs = inputs.to(device)
+                # Move tokenized inputs to the model's device
+                inputs = inputs.to(self.intent_device)
                 with torch.no_grad(): # Important for inference
-                    logits = self.intent_model(**inputs).logits
+                    outputs = self.intent_model(**inputs)
+                    logits = outputs.logits
 
                 probabilities = torch.softmax(logits, dim=1).squeeze().tolist() # Get probabilities for the text against all candidate labels
 
                 identified_intents = []
                 for i, prob in enumerate(probabilities):
-                    if prob > threshold:
+                    if prob > self.intent_classification_threshold: # Use instance variable
                         identified_intents.append(f"{self.candidate_intent_labels[i]} ({prob:.2f})")
                 return identified_intents if identified_intents else ["general_discussion"]
 
@@ -420,6 +448,25 @@ async def main():
     recent_2_turns_s1 = await stm_system.get_recent_turns(session_id_1, num_turns=2)
     logger.info(f"\nRecent 2 turns for session '{session_id_1}': {json.dumps(recent_2_turns_s1, indent=2)}")
     assert len(recent_2_turns_s1) == 2
+
+    # --- Test graceful handling of invalid inputs for add_turn ---
+    logger.info(f"\n--- Testing add_turn error handling ---")
+    await stm_system.add_turn("", {"role": "user", "content": "Test with empty session ID"}) # Empty session ID
+    await stm_system.add_turn("test_session_invalid_data", "This is not a dict") # Invalid turn_data
+
+    # --- Test summarize_session for non-existent and empty sessions ---
+    logger.info(f"\n--- Testing summarize_session for non-existent and empty sessions ---")
+    summary_non_existent = await stm_system.summarize_session("non_existent_session")
+    logger.info(f"Summary for non_existent_session: {summary_non_existent}")
+    assert "Session not found" in summary_non_existent
+
+    empty_session_id = "empty_session_test"
+    await stm_system.add_turn(empty_session_id, {"role": "system", "content": ""}) # Add a turn then clear to make session exist but empty for some definitions
+    stm_system._conversations_stub[empty_session_id].clear() # Manually ensure it's empty after creation
+    summary_empty = await stm_system.summarize_session(empty_session_id)
+    logger.info(f"Summary for {empty_session_id} (empty): {summary_empty}")
+    assert "No content" in summary_empty or "No turns" in summary_empty
+
 
     logger.info(f"\n--- Generating summary for session '{session_id_1}' ---")
     summary_s1 = await stm_system.summarize_session(session_id_1) # Uses real summarization model
