@@ -6,13 +6,12 @@ from unittest.mock import MagicMock, patch, AsyncMock
 from contextkernel.core_logic.llm_retriever import (
     LLMRetrieverConfig,
     HuggingFaceEmbeddingModel,
-    # StubLTM, # Moved
-    # StubGraphDB, # Moved
+    StubLTM,
+    StubGraphDB,
     LLMRetriever,
     RetrievedItem,
     RetrievalResponse
 )
-from contextkernel.tests.mocks.memory_stubs import StubLTM, StubGraphDB # New import for stubs
 
 # Mock external libraries that are imported at the module level in llm_retriever.py
 # We patch them where they are *used* or *imported* in the llm_retriever module.
@@ -81,7 +80,7 @@ def mock_external_libs(monkeypatch):
     monkeypatch.setattr("os.path.exists", MagicMock(return_value=False))
     monkeypatch.setattr("os.makedirs", MagicMock())
 
-# Remove whoosh_index_dir from default_config as it's no longer in LLMRetrieverConfig
+
 @pytest.fixture
 def default_config():
     """Returns a default LLMRetrieverConfig for tests."""
@@ -90,7 +89,7 @@ def default_config():
         cross_encoder_model_name=None, # Disabled by default for simpler tests
         faiss_index_path=None,
         networkx_graph_path=None,
-        # whoosh_index_dir="test_whoosh_index", # Removed
+        whoosh_index_dir="test_whoosh_index", # Use a test-specific dir
         keyword_search_enabled=True # Enable for testing _search_keyword
     )
 
@@ -164,7 +163,7 @@ def mock_faiss_instance(monkeypatch):
     return idx_instance
 
 @pytest.fixture
-def mock_whoosh_for_ltm(monkeypatch): # This fixture might be less relevant now for StubLTM tests directly
+def mock_whoosh_for_ltm(monkeypatch):
     mock_ix = MagicMock()
     mock_writer_instance = MagicMock()
     mock_ix.writer.return_value = mock_writer_instance
@@ -174,8 +173,8 @@ def mock_whoosh_for_ltm(monkeypatch): # This fixture might be less relevant now 
 class TestStubLTM:
     def test_ltm_init_no_path(self, mock_faiss_instance):
         """Tests StubLTM initialization without a FAISS path."""
-        ltm = StubLTM() # StubLTM no longer takes whoosh_ix or retriever_config
-        assert ltm.index is None
+        ltm = StubLTM()
+        assert ltm.index is None # Should be None as no path provided and no docs added
         assert ltm.faiss_index_path is None
 
     def test_ltm_init_with_path_not_exists(self, monkeypatch, mock_faiss_instance):
@@ -183,13 +182,13 @@ class TestStubLTM:
         monkeypatch.setattr("os.path.exists", MagicMock(return_value=False))
         ltm = StubLTM(faiss_index_path="non_existent_path.faiss")
         assert ltm.index is None
-        mock_faiss_module = contextkernel.core_logic.llm_retriever.faiss # This import path is fine for test setup
+        mock_faiss_module = contextkernel.core_logic.llm_retriever.faiss
         mock_faiss_module.read_index.assert_not_called()
 
     def test_ltm_init_with_path_exists_loads_index(self, monkeypatch, mock_faiss_instance):
         """Tests StubLTM initialization with an existing FAISS path."""
         monkeypatch.setattr("os.path.exists", MagicMock(return_value=True))
-        mock_read_index = MagicMock(return_value=mock_faiss_instance)
+        mock_read_index = MagicMock(return_value=mock_faiss_instance) # read_index returns our mock index
 
         mock_faiss_module = contextkernel.core_logic.llm_retriever.faiss
         monkeypatch.setattr(mock_faiss_module, "read_index", mock_read_index)
@@ -200,23 +199,23 @@ class TestStubLTM:
 
     def test_ltm_init_faiss_not_available(self, monkeypatch, caplog):
         """Tests StubLTM initialization when FAISS library is not available."""
-        monkeypatch.setattr("contextkernel.core_logic.llm_retriever.faiss", None) # Adjust path if faiss is imported differently now by stubs
+        monkeypatch.setattr("contextkernel.core_logic.llm_retriever.faiss", None)
         ltm = StubLTM()
         assert ltm.index is None
         assert "FAISS library not installed" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_ltm_add_document_creates_index_and_adds(self, mock_faiss_instance, default_config): # default_config no longer has whoosh_index_dir
+    async def test_ltm_add_document_creates_index_and_adds(self, mock_faiss_instance, default_config):
         """Tests adding a document creates FAISS index if none exists."""
-        ltm = StubLTM() # Removed retriever_config from StubLTM constructor
-        ltm.index = None
+        ltm = StubLTM(retriever_config=default_config) # No Whoosh for this test
+        ltm.index = None # Explicitly start with no index
 
         doc_id = "doc1"
         text_content = "Test doc 1"
         item_metadata = {"source": "test", "doc_id": doc_id} # ensure doc_id is in metadata for storage
         embedding = [0.1, 0.2, 0.3]
 
-        await ltm.save_document(doc_id=doc_id, text_content=text_content, embedding=embedding, metadata=item_metadata) # Renamed: add_document -> save_document
+        await ltm.add_document(doc_id=doc_id, text_content=text_content, embedding=embedding, metadata=item_metadata)
 
         assert ltm.index is not None
         # mock_faiss_instance is what ltm.index becomes due to fixture
@@ -227,47 +226,48 @@ class TestStubLTM:
 
     @pytest.mark.asyncio
     async def test_ltm_add_document_to_existing_index(self, mock_faiss_instance, default_config):
-        ltm = StubLTM() # Removed retriever_config
+        ltm = StubLTM(retriever_config=default_config)
         ltm.index = mock_faiss_instance
 
-        await ltm.save_document(doc_id="id1", text_content="Doc 1", embedding=[0.1,0.1], metadata={"source":"test", "doc_id":"id1"})
-        await ltm.save_document(doc_id="id2", text_content="Doc 2", embedding=[0.2,0.2], metadata={"source":"test", "doc_id":"id2"}) # Renamed
+        await ltm.add_document(doc_id="id1", text_content="Doc 1", embedding=[0.1,0.1], metadata={"source":"test", "doc_id":"id1"})
+        await ltm.add_document(doc_id="id2", text_content="Doc 2", embedding=[0.2,0.2], metadata={"source":"test", "doc_id":"id2"})
 
         assert mock_faiss_instance.add_with_ids.call_count == 2 # Each successful add calls this
         assert ltm.index.ntotal == 2
         assert ltm.doc_id_to_internal_idx["id2"] == 1
 
-    # This test is no longer relevant as StubLTM does not interact with Whoosh directly.
-    # @pytest.mark.asyncio
-    # async def test_ltm_add_document_with_whoosh_indexing(self, mock_faiss_instance, mock_whoosh_for_ltm, default_config):
-    #     """Tests that add_document also calls Whoosh writer if configured."""
-    #     mock_wh_ix, mock_wh_writer = mock_whoosh_for_ltm
-    #     config_with_whoosh = default_config
-    #     config_with_whoosh.keyword_search_enabled = True # Ensure Whoosh is enabled
+    @pytest.mark.asyncio
+    async def test_ltm_add_document_with_whoosh_indexing(self, mock_faiss_instance, mock_whoosh_for_ltm, default_config):
+        """Tests that add_document also calls Whoosh writer if configured."""
+        mock_wh_ix, mock_wh_writer = mock_whoosh_for_ltm
+        config_with_whoosh = default_config
+        config_with_whoosh.keyword_search_enabled = True # Ensure Whoosh is enabled
 
-    #     ltm = StubLTM(whoosh_ix=mock_wh_ix, retriever_config=config_with_whoosh)
-    #     ltm.index = mock_faiss_instance
+        ltm = StubLTM(whoosh_ix=mock_wh_ix, retriever_config=config_with_whoosh)
+        ltm.index = mock_faiss_instance
 
-    #     doc_id_whoosh = "wh001"
-    #     text_content_whoosh = "Whoosh test content"
-    #     metadata_whoosh = {"source": "test", "doc_id": doc_id_whoosh}
-    #     embedding_whoosh = [0.5, 0.5]
-    #     await ltm.save_document(doc_id=doc_id_whoosh, text_content=text_content_whoosh, embedding=embedding_whoosh, metadata=metadata_whoosh)
+        doc_id_whoosh = "wh001"
+        text_content_whoosh = "Whoosh test content"
+        metadata_whoosh = {"source": "test", "doc_id": doc_id_whoosh}
+        embedding_whoosh = [0.5, 0.5]
+        await ltm.add_document(doc_id=doc_id_whoosh, text_content=text_content_whoosh, embedding=embedding_whoosh, metadata=metadata_whoosh)
 
-    #     mock_wh_writer.add_document.assert_called_once_with(doc_id=doc_id_whoosh, content=text_content_whoosh)
-    #     mock_wh_writer.commit.assert_called_once()
+        mock_wh_writer.add_document.assert_called_once_with(doc_id=doc_id_whoosh, content=text_content_whoosh)
+        mock_wh_writer.commit.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_ltm_search_empty_index(self, default_config):
-        ltm = StubLTM() # Removed retriever_config
+        ltm = StubLTM(retriever_config=default_config)
+        # ltm.index is None initially
         results = await ltm.search(query_embedding=[0.1,0.2], top_k=3)
         assert results == []
 
     @pytest.mark.asyncio
     async def test_ltm_search_faiss_success(self, mock_faiss_instance, default_config):
-        ltm = StubLTM() # Removed retriever_config
-        ltm.index = mock_faiss_instance
+        ltm = StubLTM(retriever_config=default_config)
+        ltm.index = mock_faiss_instance # Use the auto-mocked one
 
+        # Populate internal_idx_to_doc_item as if docs were added
         item1 = RetrievedItem(content="Result doc1", source="ltm_test", metadata={"doc_id": "res1"})
         ltm.internal_idx_to_doc_item[0] = item1
         ltm.doc_id_to_internal_idx["res1"] = 0
@@ -300,10 +300,11 @@ class TestStubLTM:
 
     @pytest.mark.asyncio
     async def test_ltm_add_document_no_doc_id(self, caplog, default_config):
-        ltm = StubLTM() # Removed retriever_config
-        await ltm.save_document(doc_id=None, text_content="No doc id here", embedding=[0.1,0.2], metadata={}) # type: ignore
-        assert "doc_id missing" in caplog.text
-        assert ltm.index is None
+        ltm = StubLTM(retriever_config=default_config)
+        item_no_id = RetrievedItem(content="No doc id here", source="test", metadata={})
+        await ltm.add_document(item_no_id, [0.1,0.2])
+        assert "Document item is missing 'doc_id' in metadata" in caplog.text
+        assert ltm.index is None # Index should not be created if doc has no id for mapping.
 
 # --- Test StubGraphDB (NetworkX Integration) ---
 
@@ -364,18 +365,13 @@ class TestStubGraphDB:
         db = StubGraphDB()
         db.graph = mock_nx_graph_fixture # Ensure it uses the test-specific graph mock
 
-        # Adapting to new add_entities and add_relations signatures
-        await db.add_entities(entities=[{"id": "node1", "properties": {"name": "Node One", "type": "person"}}])
-        await db.add_entities(entities=[{"id": "node2", "properties": {"name": "Node Two", "type": "place"}}])
-        await db.add_relations(relations=[{"subject_id": "node1", "object_id": "node2", "type": "VISITED", "properties": {"year": 2023}}])
+        await db.add_node("node1", name="Node One", type="person")
+        await db.add_node("node2", name="Node Two", type="place")
+        await db.add_relation("node1", "node2", type="VISITED", year=2023)
 
-        # The mock_nx_graph_fixture's add_node/add_edge are called by the stub's adapted methods
-        # Check if underlying nx.add_node was called correctly by add_entities
         mock_nx_graph_fixture.add_node.assert_any_call("node1", name="Node One", type="person")
         mock_nx_graph_fixture.add_node.assert_any_call("node2", name="Node Two", type="place")
-        # Check if underlying nx.add_edge was called correctly by add_relations
         mock_nx_graph_fixture.add_edge.assert_called_once_with("node1", "node2", type="VISITED", year=2023)
-
 
     @pytest.mark.asyncio
     async def test_graphdb_search_node_by_id(self, mock_nx_graph_fixture):
@@ -387,14 +383,11 @@ class TestStubGraphDB:
         mock_nx_graph_fixture.nodes = {"node1": {"name": "Test Node", "attr": "val"}}
         mock_nx_graph_fixture.edges = MagicMock(return_value=[("node1", "other_node", {"type": "CONNECTS_TO"})])
 
-        results = await db.search(query="node1", top_k=1) # search method in stub unchanged
+        results = await db.search(query="node1", top_k=1)
         assert len(results) == 1
-        # Content structure of RetrievedItem from StubGraphDB.search (node match) is:
-        # {"id": query, "data": self.graph.nodes[query]}
-        # metadata is self.graph.nodes[query]
-        assert results[0].source == "graph_db_node_direct_match"
-        assert results[0].content["id"] == "node1"
-        assert results[0].content["data"]["name"] == "Test Node"
+        assert results[0].source == "graph_db_nx_node_id_match"
+        assert results[0].content["node_id"] == "node1"
+        assert results[0].content["properties"]["name"] == "Test Node"
 
     @pytest.mark.asyncio
     async def test_graphdb_search_node_by_property(self, mock_nx_graph_fixture):
@@ -428,13 +421,10 @@ class TestStubGraphDB:
             ("nodeB", {"name": "Bob", "occupation": "artist"})
         ])
 
-        results = await db.search(query="name:Alice", top_k=1) # search method in stub unchanged
+        results = await db.search(query="name:Alice", top_k=1)
         assert len(results) == 1
-        # Content structure of RetrievedItem from StubGraphDB.search (property match) is:
-        # {"id": node, "data": data}
-        # metadata is data
-        assert results[0].source == "graph_db_node_property_match"
-        assert results[0].content["data"]["name"] == "Alice"
+        assert results[0].source == "graph_db_nx_property_match"
+        assert results[0].content["properties"]["name"] == "Alice"
 
     @pytest.mark.asyncio
     async def test_graphdb_save_graph_gml(self, monkeypatch, mock_nx_graph_fixture):
@@ -456,52 +446,54 @@ def mock_ltm_interface():
     ltm = MagicMock(spec=StubLTM) # Use spec to ensure it mocks StubLTM's interface
     ltm.search = AsyncMock(return_value=[]) # Default to no results
     # Mock attributes that LLMRetriever.__init__ tries to set
-    # ltm.whoosh_ix = None # Removed, StubLTM no longer has this
-    # ltm.retriever_config = None # Removed
+    ltm.whoosh_ix = None
+    ltm.retriever_config = None
     return ltm
 
 @pytest.fixture
 def mock_graphdb_interface():
-    graphdb = MagicMock(spec=StubGraphDB) # Should use GraphDBInterface if LLMRetriever type hints it
+    graphdb = MagicMock(spec=StubGraphDB)
     graphdb.search = AsyncMock(return_value=[])
     return graphdb
 
 @pytest.fixture
-def mock_keyword_searcher_interface():
-    searcher = AsyncMock(spec=KeywordSearcherInterface) # Use AsyncMock for async methods
-    searcher.search = AsyncMock(return_value=[])
-    # initialize_searcher is synchronous in the interface
-    searcher.initialize_searcher = MagicMock()
-    return searcher
-
-@pytest.fixture
-def llm_retriever(default_config, mock_ltm_interface, mock_graphdb_interface, mock_keyword_searcher_interface): # Added mock_keyword_searcher_interface
+def llm_retriever(default_config, mock_ltm_interface, mock_graphdb_interface):
     """Fixture to create an LLMRetriever instance with mocked dependencies."""
+    # Embedding model (HuggingFaceEmbeddingModel) is already mocked by mock_external_libs
+    # CrossEncoder is also mocked by mock_external_libs
+    # Whoosh index creation/opening is also mocked
+
+    # Ensure that the mock_ltm_interface has whoosh_ix and retriever_config attributes
+    # if they are accessed during LLMRetriever initialization.
+    # The spec arg to MagicMock doesn't create these automatically if they are just attributes.
+    # We can add them here if needed, or ensure __init__ checks with hasattr.
+    # Based on current LLMRetriever.__init__, it uses hasattr, so this should be fine.
 
     retriever = LLMRetriever(
         retriever_config=default_config,
         ltm_interface=mock_ltm_interface,
-        stm_interface=MagicMock(),
+        stm_interface=MagicMock(), # Basic mock for STM, not heavily used yet
         graphdb_interface=mock_graphdb_interface,
-        keyword_searcher=mock_keyword_searcher_interface if default_config.keyword_search_enabled else None, # Pass the mock searcher
-        query_llm=None
+        query_llm=None # No query LLM for these tests yet
     )
     return retriever
 
 class TestLLMRetriever:
-    def test_retriever_init_components(self, llm_retriever, default_config, mock_ltm_interface, mock_keyword_searcher_interface): # Added mock_keyword_searcher_interface
+    def test_retriever_init_components(self, llm_retriever, default_config, mock_ltm_interface):
         """Tests that components are initialized in LLMRetriever."""
         assert llm_retriever.retriever_config == default_config
         assert llm_retriever.ltm == mock_ltm_interface
-        assert llm_retriever.embedding_model is not None
+        assert llm_retriever.embedding_model is not None # Mocked by global fixture
 
         if default_config.keyword_search_enabled:
-            assert llm_retriever.keyword_searcher == mock_keyword_searcher_interface
-            # Old checks for llm_retriever.whoosh_ix and passing to ltm are removed
+            assert llm_retriever.whoosh_ix is not None # Mocked by global fixture
+            # Check if it was passed to LTM
+            assert mock_ltm_interface.whoosh_ix is not None
+            assert mock_ltm_interface.retriever_config is not None
         else:
-            assert llm_retriever.keyword_searcher is None
+            assert llm_retriever.whoosh_ix is None
 
-        if default_config.cross_encoder_model_name:
+        if default_config.cross_encoder_model_name: # e.g. "cross-encoder-model"
             assert llm_retriever.cross_encoder is not None
             # Check that CrossEncoder constructor was called
             mock_external_libs_cross_encoder = contextkernel.core_logic.llm_retriever.CrossEncoder
@@ -535,42 +527,42 @@ class TestLLMRetriever:
         mock_ltm_interface.search.assert_called_once_with(query_embedding=query_embedding, top_k=1, filters=None)
 
     @pytest.mark.asyncio
-    async def test_retriever_search_keyword_enabled(self, llm_retriever, mock_keyword_searcher_interface): # Use the injected mock
+    async def test_retriever_search_keyword_enabled(self, llm_retriever, monkeypatch):
         """Tests keyword search when enabled."""
         llm_retriever.retriever_config.keyword_search_enabled = True
-        llm_retriever.keyword_searcher = mock_keyword_searcher_interface # Ensure it's set
-
-        mock_keyword_searcher_interface.search.return_value = [
-            RetrievedItem(content="Keyword content", source="keyword_whoosh", score=0.85, metadata={"doc_id": "whoosh_doc1"})
+        # Ensure whoosh_ix is the mocked one from global fixture
+        mock_searcher_instance = MagicMock()
+        mock_searcher_instance.search.return_value = [ # Simulate Whoosh Hit objects
+            {"doc_id": "whoosh_doc1", "content": "Keyword content", "score": 0.85}
         ]
+        # The context manager `with self.whoosh_ix.searcher() as searcher:` needs specific mocking
+        mock_whoosh_index_on_retriever = llm_retriever.whoosh_ix # This is the globally mocked Whoosh index
+        mock_searcher_cm = MagicMock() # Mock for the context manager object
+        mock_searcher_cm.__enter__.return_value = mock_searcher_instance # __enter__ returns the searcher
+        mock_whoosh_index_on_retriever.searcher.return_value = mock_searcher_cm
 
-        results = await llm_retriever._search_keyword("test query", top_k=1, filters={"test_filter": "val"})
+        # Mock QueryParser
+        mock_qparser_instance = MagicMock()
+        mock_qparser_instance.parse.return_value = "parsed_query_obj"
+        mock_qparser_constructor = MagicMock(return_value=mock_qparser_instance)
+        monkeypatch.setattr("contextkernel.core_logic.llm_retriever.QueryParser", mock_qparser_constructor)
+
+        results = await llm_retriever._search_keyword("test query", top_k=1)
 
         assert len(results) == 1
         assert results[0].content == "Keyword content"
-        assert results[0].source == "keyword_whoosh" # Source should be from the searcher
-        mock_keyword_searcher_interface.search.assert_called_once_with("test query", 1, {"test_filter": "val"})
+        assert results[0].source == "keyword_search"
+        mock_qparser_constructor.assert_called_once_with("content", schema=llm_retriever.whoosh_ix.schema)
+        mock_qparser_instance.parse.assert_called_once_with("test query")
+        mock_searcher_instance.search.assert_called_once_with("parsed_query_obj", limit=1)
 
 
     @pytest.mark.asyncio
-    async def test_retriever_search_keyword_disabled_by_config(self, llm_retriever, mock_keyword_searcher_interface):
-        """Tests that keyword search returns empty if disabled by config."""
+    async def test_retriever_search_keyword_disabled(self, llm_retriever):
+        """Tests that keyword search returns empty if disabled."""
         llm_retriever.retriever_config.keyword_search_enabled = False
-        # Keyword searcher might still be present but should not be called
-
         results = await llm_retriever._search_keyword("test", top_k=5)
         assert results == []
-        mock_keyword_searcher_interface.search.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_retriever_search_keyword_no_searcher(self, llm_retriever, mock_keyword_searcher_interface):
-        """Tests that keyword search returns empty if no searcher is provided."""
-        llm_retriever.retriever_config.keyword_search_enabled = True # Enabled in config
-        llm_retriever.keyword_searcher = None # But no searcher injected
-
-        results = await llm_retriever._search_keyword("test", top_k=5)
-        assert results == []
-        # mock_keyword_searcher_interface.search.assert_not_called() # Not relevant as it's None
 
     @pytest.mark.asyncio
     async def test_retriever_consolidate_simple_aggregation(self, llm_retriever):
@@ -628,27 +620,29 @@ class TestLLMRetriever:
 
 
     @pytest.mark.asyncio
-    async def test_retriever_retrieve_all_strategy(self, llm_retriever, mock_ltm_interface, mock_graphdb_interface, mock_keyword_searcher_interface): # Added mock_keyword_searcher_interface
+    async def test_retriever_retrieve_all_strategy(self, llm_retriever, mock_ltm_interface, mock_graphdb_interface, monkeypatch):
         """Tests the 'all' retrieval strategy."""
         query = "Retrieve everything"
-        llm_retriever.retriever_config.keyword_search_enabled = True # Ensure keyword search is active for this test
-        llm_retriever.keyword_searcher = mock_keyword_searcher_interface
-
 
         # Mock responses from each source
         llm_retriever.embedding_model.generate_embedding = AsyncMock(return_value=[0.5]*5)
         mock_ltm_interface.search.return_value = [RetrievedItem(content="LTM data", source="ltm", score=0.7, metadata={"doc_id":"ltm1"})]
         mock_graphdb_interface.search.return_value = [RetrievedItem(content="Graph data", source="graph", score=0.8, metadata={"doc_id":"graph1"})]
-        mock_keyword_searcher_interface.search.return_value = [RetrievedItem(content="Keyword data", source="keyword_whoosh", score=0.9, metadata={"doc_id":"kw1"})]
 
+        # Mock keyword search part for 'all' strategy
+        mock_searcher_instance = MagicMock()
+        mock_searcher_instance.search.return_value = [{"doc_id": "kw1", "content": "Keyword data", "score": 0.9}]
+        mock_searcher_cm = MagicMock(); mock_searcher_cm.__enter__.return_value = mock_searcher_instance
+        llm_retriever.whoosh_ix.searcher.return_value = mock_searcher_cm
+        monkeypatch.setattr("contextkernel.core_logic.llm_retriever.QueryParser", MagicMock(return_value=MagicMock(parse=MagicMock(return_value="p"))))
 
         response = await llm_retriever.retrieve(query, retrieval_strategy="all")
 
         assert len(response.items) == 3
-        assert response.items[0].content == "Keyword data"
+        assert response.items[0].content == "Keyword data" # Highest score
         mock_ltm_interface.search.assert_called_once()
         mock_graphdb_interface.search.assert_called_once()
-        mock_keyword_searcher_interface.search.assert_called_once()
+        llm_retriever.whoosh_ix.searcher.assert_called_once() # Check if Whoosh searcher was used
 
 
     @pytest.mark.asyncio
