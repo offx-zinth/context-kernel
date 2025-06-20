@@ -291,11 +291,243 @@ class GraphDB:
     async def cypher_query(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         param_str = json.dumps(parameters, sort_keys=True) if parameters else "{}"
         logger.info(f"Executing direct Cypher query: {query} with params: {param_str}")
-        # Determine if it's a write query based on keywords. This is a basic heuristic.
-        # More robust solutions might involve parsing or specific flags.
         is_write_query = any(keyword in query.upper() for keyword in ["CREATE", "MERGE", "SET", "DELETE", "REMOVE", "CALL"])
-
         return await self._execute_query_neo4j(query, parameters, write=is_write_query)
+
+    # --- Higher-level methods for LLMListener interaction ---
+
+    async def ensure_source_document_node(self, document_id: str, properties: Dict[str, Any]) -> bool:
+        logger.info(f"Ensuring SourceDocument node: ID='{document_id}', Properties={json.dumps(properties)}")
+        # Add fixed properties like a creation/update timestamp if not already in properties
+        properties['updated_at'] = asyncio.get_running_loop().time() # Simple timestamp
+        return await self.create_node(node_id=document_id, labels=["SourceDocument"], properties=properties)
+
+    async def add_memory_fragment_link(self, document_id: str, fragment_id: str, fragment_main_label: str, relationship_type: str, fragment_properties: Dict[str, Any]) -> bool:
+        logger.info(f"Adding memory fragment link: Document ID='{document_id}', Fragment ID='{fragment_id}', Label='{fragment_main_label}', Rel='{relationship_type}'")
+        fragment_properties['updated_at'] = asyncio.get_running_loop().time()
+
+        node_created = await self.create_node(node_id=fragment_id, labels=[fragment_main_label, "MemoryFragment"], properties=fragment_properties)
+        if not node_created:
+            logger.error(f"Failed to create MemoryFragment node: ID='{fragment_id}'")
+            return False
+
+        edge_created = await self.create_edge(source_node_id=document_id, target_node_id=fragment_id, relationship_type=relationship_type, properties={"created_at": asyncio.get_running_loop().time()})
+        if not edge_created:
+            logger.error(f"Failed to create edge from Document '{document_id}' to Fragment '{fragment_id}'")
+            # Optionally, consider cleanup logic for the fragment node if edge creation fails critically
+            return False
+        return True
+
+    async def add_entities_to_document(self, document_id: str, entities: List[Dict[str, Any]]) -> bool:
+        logger.info(f"Adding {len(entities)} entities to Document ID='{document_id}'")
+        if not entities:
+            return True # No entities to add
+
+        # Ensure SourceDocument exists (or handle error if critical)
+        source_doc_exists = await self.get_node(document_id)
+        if not source_doc_exists:
+            logger.warning(f"SourceDocument with ID '{document_id}' not found. Entities will be created but not linked to a source document unless ensure_source_document_node was called prior.")
+            # Depending on desired strictness, one might return False here.
+            # For now, we'll allow entities to be created orphan-like if document_id doesn't match an existing node.
+
+        all_success = True
+        for entity_data in entities:
+            entity_text = entity_data.get("text")
+            entity_type = entity_data.get("type", "UnknownEntity")
+            entity_metadata = entity_data.get("metadata", {})
+
+            if not entity_text:
+                logger.warning(f"Skipping entity with no text: {entity_data}")
+                continue
+
+            # Create a deterministic entity ID if possible, or use a unique one.
+            # For simplicity, using text and type for ID, but this might need a more robust unique ID strategy (e.g., hashing, UUIDs)
+            # especially if text can be very long or non-unique across types.
+            entity_node_id = f"entity_{entity_type.lower()}_{entity_text.lower().replace(' ', '_')}"[:255] # Keep ID length reasonable
+
+            entity_props = {
+                "text": entity_text,
+                "type": entity_type,
+                "updated_at": asyncio.get_running_loop().time(),
+                **entity_metadata
+            }
+
+            entity_created = await self.create_node(node_id=entity_node_id, labels=["Entity", entity_type], properties=entity_props)
+            if not entity_created:
+                logger.error(f"Failed to create Entity node: ID='{entity_node_id}'")
+                all_success = False
+                continue # Skip trying to link if entity creation failed
+
+            # Link entity to the source document
+            edge_created = await self.create_edge(source_node_id=document_id, target_node_id=entity_node_id, relationship_type="CONTAINS_ENTITY", properties={"created_at": asyncio.get_running_loop().time()})
+            if not edge_created:
+                logger.error(f"Failed to link Entity '{entity_node_id}' to Document '{document_id}'")
+                all_success = False
+
+        return all_success
+
+    async def add_relations_to_document(self, document_id: str, relations: List[Dict[str, Any]]) -> bool:
+        logger.info(f"Adding {len(relations)} relations to Document ID='{document_id}'")
+        if not relations:
+            return True
+
+        all_success = True
+        for rel_data in relations:
+            subject_text = rel_data.get("subject")
+            object_text = rel_data.get("object")
+            verb = rel_data.get("verb", rel_data.get("type", "RELATED_TO")) # 'type' for backward compat or 'verb'
+            context = rel_data.get("context")
+            rel_metadata = rel_data.get("metadata", {})
+
+            if not all([subject_text, object_text, verb]):
+                logger.warning(f"Skipping incomplete relation data: {rel_data}")
+                continue
+
+            # Assumption: Entity nodes for subject and object already exist or are created here.
+            # For simplicity, we'll use a similar ID generation as in add_entities_to_document.
+            # This implies entities might be re-MERGED here if not passed with types.
+            # A more robust way would be to pass entity types or ensure entities are created first with types.
+            subj_type_guess = "UnknownEntity" # Ideally, type info would come from relation extraction
+            obj_type_guess = "UnknownEntity"  # Or LLMListener should pass entity types along with relations
+
+            subject_node_id = f"entity_{subj_type_guess.lower()}_{subject_text.lower().replace(' ', '_')}"[:255]
+            object_node_id = f"entity_{obj_type_guess.lower()}_{object_text.lower().replace(' ', '_')}"[:255]
+
+            # Ensure subject entity node exists (MERGE behavior of create_node handles this)
+            await self.create_node(node_id=subject_node_id, labels=["Entity", subj_type_guess], properties={"text": subject_text, "type": subj_type_guess, "updated_at": asyncio.get_running_loop().time()})
+            # Ensure object entity node exists
+            await self.create_node(node_id=object_node_id, labels=["Entity", obj_type_guess], properties={"text": object_text, "type": obj_type_guess, "updated_at": asyncio.get_running_loop().time()})
+
+            rel_props = {
+                "context": context,
+                "updated_at": asyncio.get_running_loop().time(),
+                **rel_metadata
+            }
+
+            edge_created = await self.create_edge(source_node_id=subject_node_id, target_node_id=object_node_id, relationship_type=verb.upper().replace(" ", "_"), properties=rel_props)
+            if not edge_created:
+                logger.error(f"Failed to create relation edge: {subject_node_id} -[{verb}]-> {object_node_id}")
+                all_success = False
+                continue
+
+            # Optionally, link this relation (edge) back to the source document.
+            # This is tricky if the relation is just an edge. If relations were nodes, it'd be easier.
+            # One way: Create a "RelationConcept" node that reifies the edge, then link that to the document.
+            # For now, direct relation edges are created. Linking them to document_id is implicit via entities.
+            # If explicit link needed:
+            # relation_concept_id = f"rel_{document_id}_{subject_node_id}_{verb}_{object_node_id}"[:255]
+            # await self.create_node(relation_concept_id, ["RelationConcept"], {"description": f"{subject_text} {verb} {object_text}"})
+            # await self.create_edge(document_id, relation_concept_id, "DESCRIBES_RELATION")
+            # await self.create_edge(relation_concept_id, subject_node_id, "HAS_SUBJECT")
+            # await self.create_edge(relation_concept_id, object_node_id, "HAS_OBJECT")
+
+        return all_success
+
+    # --- Enhanced Search Method ---
+    async def search(self, query_text: str, top_k: int = 10, search_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        logger.info(f"GraphDB.search called with query: '{query_text}', top_k: {top_k}, config: {search_config}")
+
+        # TODO: Use search_config to enable/disable parts of the UNION or change behavior.
+        # For now, it searches Entities and STMEntries. LTM and RawCache could be added.
+
+        # Using a common subquery for collecting related info to reduce redundancy might be complex with UNIONs for primary match.
+        # Instead, each part of the UNION will collect what it can.
+
+        unified_query = """
+        // Part 1: Match Entities
+        MATCH (e:Entity) WHERE e.text CONTAINS $query_text
+        OPTIONAL MATCH (e)<-[:CONTAINS_ENTITY]-(sd:SourceDocument)
+        OPTIONAL MATCH (sd)-[:HAS_STM_REPRESENTATION]->(stm:STMEntry)
+        OPTIONAL MATCH (sd)-[:HAS_LTM_REPRESENTATION]->(ltm:LTMLogEntry)
+        WITH e, sd, stm, ltm, 1.0 AS relevance_score, 'Entity' AS match_type, e.type AS entity_type
+        RETURN
+            e.node_id AS id,
+            e.text AS content,
+            match_type + ': ' + entity_type AS source_description, // e.g., "Entity: Person"
+            sd.node_id AS document_id,
+            sd.preview AS document_preview,
+            stm.text AS summary_text,
+            ltm.text AS ltm_text,
+            properties(e) AS matched_node_properties, // Properties of the primarily matched node (Entity)
+            relevance_score AS score
+
+        UNION ALL
+
+        // Part 2: Match STM Entries (Summaries)
+        MATCH (stm:STMEntry) WHERE stm.text CONTAINS $query_text
+        OPTIONAL MATCH (stm)<-[:HAS_STM_REPRESENTATION]-(sd:SourceDocument)
+        // Optionally, find some entities in the source document to provide context
+        OPTIONAL MATCH (sd)-[:CONTAINS_ENTITY]->(related_e:Entity)
+        WITH stm, sd, COLLECT(related_e.text)[..5] AS related_entities_sample, 0.9 AS relevance_score, 'STMEntry' AS match_type
+        RETURN
+            stm.node_id AS id,
+            stm.text AS content,
+            match_type AS source_description, // e.g., "STMEntry"
+            sd.node_id AS document_id,
+            sd.preview AS document_preview,
+            NULL AS summary_text, // Already the main content
+            NULL AS ltm_text,     // Could fetch if LTM is different and linked
+            properties(stm) AS matched_node_properties, // Properties of the primarily matched node (STMEntry)
+            relevance_score AS score
+            // Note: related_entities_sample is available here if needed in post-processing,
+            // but RETURN structure must be consistent for UNION ALL.
+            // One way is to stringify it or add to metadata in post-processing.
+
+        // Future parts for LTM, RawCache, etc. could be added here with UNION ALL
+        // ORDER BY score DESC // This should ideally be outside if possible, or each subquery limits and then final sort/limit
+        // LIMIT $limit // Applying limit after UNION ALL is better
+        """
+
+        # For a query with UNION, it's often better to apply ORDER BY and LIMIT to the entire result set.
+        # However, intermediate LIMITs within each part of the UNION might be needed for performance on large graphs
+        # if a global ORDER BY and LIMIT is too slow. This query does not yet have that.
+        # A common pattern is:
+        # WITH query_part_1_results AS ( ... LIMIT X ), query_part_2_results AS ( ... LIMIT X )
+        # SELECT * FROM query_part_1_results UNION ALL SELECT * FROM query_part_2_results ORDER BY score DESC LIMIT $limit_overall
+
+        # Simpler approach for now: execute the UNION and then limit in Python, or rely on a global LIMIT if added to Cypher.
+        # Adding ORDER BY and LIMIT to the unified query:
+        final_query_with_order_limit = f"""
+        {unified_query}
+        ORDER BY score DESC
+        LIMIT $limit
+        """
+
+        params = {"query_text": query_text, "limit": top_k}
+
+        raw_results = []
+        try:
+            raw_results = await self._execute_query_neo4j(final_query_with_order_limit, params)
+        except Exception as e:
+            logger.error(f"Error during graph search execution with UNION query: {e}", exc_info=True)
+            return []
+
+        final_retrieved_items = []
+        for record in raw_results:
+            item_metadata = record.get("matched_node_properties", {}) # Base metadata from the matched node
+            item_metadata["document_id"] = record.get("document_id")
+            item_metadata["document_preview"] = record.get("document_preview")
+
+            # Add other relevant fields to metadata if they exist and are not already part of matched_node_properties
+            if record.get("summary_text") and record.get("source_description") != "STMEntry": # Avoid summary if STM is the source
+                 item_metadata["summary_text"] = record.get("summary_text")
+            if record.get("ltm_text"):
+                item_metadata["ltm_text"] = record.get("ltm_text")
+            # if record.get("related_entities_sample"): # If this was returned directly
+            #    item_metadata["related_entities_sample"] = record.get("related_entities_sample")
+
+
+            retrieved_item = {
+                "id": record.get("id"),
+                "content": record.get("content", ""),
+                "source": f"graph_db_{record.get('source_description', 'unknown').lower().replace(': ', '_').replace(' ', '_')}",
+                "score": record.get("score", 0.1), # Default score if somehow missing
+                "metadata": item_metadata
+            }
+            final_retrieved_items.append(retrieved_item)
+
+        logger.info(f"GraphDB.search returning {len(final_retrieved_items)} results after UNION and transformation.")
+        return final_retrieved_items
 
 
     async def vector_search(self, embedding: List[float], top_k: int = 5, index_name: str = "node_embedding_index", node_label: Optional[str] = None, embedding_property: str = "embedding") -> List[Dict[str, Any]]:

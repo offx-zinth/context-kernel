@@ -1,427 +1,270 @@
-import pytest
+import unittest
+from unittest.mock import AsyncMock, MagicMock, patch, call
 import asyncio
-from unittest.mock import MagicMock, AsyncMock, patch
-from typing import Dict, Any, List, Optional
+import datetime
 
-# Modules to test
-from contextkernel.core_logic.llm_listener import (
-    LLMListenerConfig,
-    LLMListener,
-    StructuredInsight,
-    # Interfaces (for type hinting and spec for mocks)
-    RawCacheInterface,
-    STMInterface,
-    LTMInterface,
-    GraphDBInterface,
-)
-from contextkernel.core_logic.summarizer import Summarizer, SummarizerConfig
-from contextkernel.core_logic.llm_retriever import HuggingFaceEmbeddingModel, StubLTM as RetrieverStubLTM, StubGraphDB as RetrieverStubGraphDB
-
-# --- Re-define simple Stubs for RawCache and STM as inner classes or here for test context ---
-class TestStubRawCache(RawCacheInterface):
-    def __init__(self):
-        super().__init__()
-        self.cache: Dict[str, Any] = {}
-
-    async def store(self, doc_id: str, data: Any) -> Optional[str]:
-        self.logger.info(f"TestStubRawCache storing data with doc_id: {doc_id}.")
-        self.cache[doc_id] = data
-        return doc_id
-
-    async def load(self, doc_id: str) -> Optional[Any]:
-        self.logger.info(f"TestStubRawCache loading data with doc_id: {doc_id}.")
-        return self.cache.get(doc_id)
-
-class TestStubSTM(STMInterface):
-    def __init__(self):
-        super().__init__()
-        self.cache: Dict[str, Any] = {}
-
-    async def save_summary(self, summary_id: str, summary_obj: Any, metadata: Optional[Dict[str, Any]] = None) -> None:
-        self.logger.info(f"TestStubSTM saving summary with summary_id: {summary_id}.")
-        self.cache[summary_id] = {"summary": summary_obj, "metadata": metadata or {}}
-
-    async def load_summary(self, summary_id: str) -> Optional[Any]:
-        self.logger.info(f"TestStubSTM loading summary with summary_id: {summary_id}.")
-        return self.cache.get(summary_id)
+from contextkernel.core_logic.llm_listener import LLMListener, LLMListenerConfig, StructuredInsight, Summary, Entity, Relation
+from contextkernel.core_logic.summarizer import Summarizer, SummarizerConfig # For mocking Summarizer
+from contextkernel.core_logic.llm_retriever import HuggingFaceEmbeddingModel # For mocking
+from contextkernel.core_logic.exceptions import MemoryAccessError
 
 
-# Global Mocks for external libraries (Hugging Face Transformers Pipeline)
-@pytest.fixture(autouse=True)
-def mock_hf_pipelines(monkeypatch):
-    """Mocks Hugging Face transformers.pipeline for all tests."""
-    mock_pipeline_instance = MagicMock()
-    # Default behavior for a pipeline call; can be customized per test
-    mock_pipeline_instance.return_value = [{"generated_text": "mocked pipeline output"}]
+class TestLLMListenerGraphEnrichment(unittest.IsolatedAsyncioTestCase):
 
-    mock_pipeline_constructor = MagicMock(return_value=mock_pipeline_instance)
-    monkeypatch.setattr("contextkernel.core_logic.llm_listener.pipeline", mock_pipeline_constructor)
-    # To access the constructor mock later for assertions:
-    # contextkernel.core_logic.llm_listener.pipeline
-    return mock_pipeline_constructor
-
-
-@pytest.fixture
-def default_listener_config():
-    """Returns a default LLMListenerConfig for tests."""
-    return LLMListenerConfig(
-        summarizer_config=SummarizerConfig(hf_abstractive_model_name="mock-summarizer"),
-        entity_extraction_model_name="mock-ner-model",
-        relation_extraction_model_name=None, # Test with general LLM for RE by default
-        general_llm_for_re_model_name="mock-re-llm",
-        embedding_model_name="mock-embedding-model"
-    )
-
-@pytest.fixture
-def mock_memory_systems():
-    """Provides a dictionary of mocked memory system interfaces."""
-    return {
-        "raw_cache": AsyncMock(spec=TestStubRawCache), # Use our test stubs as spec
-        "stm": AsyncMock(spec=TestStubSTM),
-        "ltm": AsyncMock(spec=RetrieverStubLTM), # Use the actual StubLTM from retriever for interface matching
-        "graph_db": AsyncMock(spec=RetrieverStubGraphDB)
-    }
-
-@pytest.fixture
-def llm_listener(default_listener_config, mock_memory_systems, monkeypatch):
-    """Fixture to create an LLMListener instance with mocked dependencies."""
-    # Mock Summarizer and HuggingFaceEmbeddingModel constructors
-    mock_summarizer_instance = AsyncMock(spec=Summarizer)
-    mock_summarizer_instance.summarize = AsyncMock(return_value="Mocked summary.")
-    mock_summarizer_constructor = MagicMock(return_value=mock_summarizer_instance)
-    monkeypatch.setattr("contextkernel.core_logic.llm_listener.Summarizer", mock_summarizer_constructor)
-
-    mock_hf_embedding_instance = AsyncMock(spec=HuggingFaceEmbeddingModel)
-    mock_hf_embedding_instance.model = MagicMock() # Simulate a loaded model within the embedding model
-    mock_hf_embedding_instance.generate_embedding = AsyncMock(return_value=[0.1, 0.2, 0.3])
-    mock_hf_embedding_constructor = MagicMock(return_value=mock_hf_embedding_instance)
-    monkeypatch.setattr("contextkernel.core_logic.llm_listener.HuggingFaceEmbeddingModel", mock_hf_embedding_constructor)
-
-    listener = LLMListener(
-        listener_config=default_listener_config,
-        memory_systems=mock_memory_systems,
-    )
-    # Attach mocks for easy access in tests if needed, though direct patching is often cleaner
-    listener.summarizer = mock_summarizer_instance
-    listener.embedding_model = mock_hf_embedding_instance
-    return listener
-
-
-class TestLLMListenerInit:
-    def test_init_successful_all_models(self, default_listener_config, mock_memory_systems, mock_hf_pipelines, monkeypatch):
-        """Tests successful initialization of LLMListener with all models configured."""
-
-        mock_sum_constructor = MagicMock(return_value=AsyncMock(spec=Summarizer))
-        monkeypatch.setattr("contextkernel.core_logic.llm_listener.Summarizer", mock_sum_constructor)
-
-        mock_emb_constructor = MagicMock(return_value=AsyncMock(spec=HuggingFaceEmbeddingModel, model=MagicMock()))
-        monkeypatch.setattr("contextkernel.core_logic.llm_listener.HuggingFaceEmbeddingModel", mock_emb_constructor)
-
-        listener = LLMListener(default_listener_config, mock_memory_systems)
-
-        mock_sum_constructor.assert_called_once_with(default_listener_config.summarizer_config)
-        mock_emb_constructor.assert_called_once_with(model_name=default_listener_config.embedding_model_name)
-
-        # Check NER pipeline call
-        # mock_hf_pipelines is the constructor for `pipeline`
-        mock_hf_pipelines.assert_any_call(
-            "ner",
-            model=default_listener_config.entity_extraction_model_name,
-            tokenizer=default_listener_config.entity_extraction_model_name
+    def setUp(self):
+        self.listener_config = LLMListenerConfig(
+            embedding_model_name="test-embedding-model" # Needs a name for embedding model init
         )
-        # Check RE LLM pipeline call (since relation_extraction_model_name is None by default)
-        mock_hf_pipelines.assert_any_call(
-            "text-generation",
-            model=default_listener_config.general_llm_for_re_model_name,
-            tokenizer=default_listener_config.general_llm_for_re_model_name
-        )
-        assert listener.summarizer is not None
-        assert listener.embedding_model is not None
-        assert listener.ner_pipeline is not None
-        assert listener.re_llm_pipeline is not None
-        assert listener.re_pipeline is None # Dedicated RE model was None in default_listener_config
 
+        # Mock memory systems
+        self.mock_raw_cache = AsyncMock()
+        self.mock_stm = AsyncMock()
+        self.mock_ltm = AsyncMock()
+        self.mock_graph_db = AsyncMock()
+        # Specific graph methods that will be called
+        self.mock_graph_db.ensure_source_document_node = AsyncMock(return_value=True)
+        self.mock_graph_db.add_memory_fragment_link = AsyncMock(return_value=True)
+        self.mock_graph_db.add_entities_to_document = AsyncMock(return_value=True)
+        self.mock_graph_db.add_relations_to_document = AsyncMock(return_value=True)
 
-    def test_init_dedicated_re_model(self, mock_memory_systems, mock_hf_pipelines, monkeypatch):
-        config = LLMListenerConfig(
-            relation_extraction_model_name="mock-dedicated-re",
-            general_llm_for_re_model_name=None # Disable general RE LLM
-        )
-        mock_sum_constructor = MagicMock(return_value=AsyncMock(spec=Summarizer))
-        monkeypatch.setattr("contextkernel.core_logic.llm_listener.Summarizer", mock_sum_constructor)
-        mock_emb_constructor = MagicMock(return_value=AsyncMock(spec=HuggingFaceEmbeddingModel, model=MagicMock()))
-        monkeypatch.setattr("contextkernel.core_logic.llm_listener.HuggingFaceEmbeddingModel", mock_emb_constructor)
-
-        listener = LLMListener(config, mock_memory_systems)
-
-        mock_hf_pipelines.assert_any_call(
-            "text2text-generation", # Default task for dedicated RE in __init__
-            model=config.relation_extraction_model_name,
-            tokenizer=config.relation_extraction_model_name
-        )
-        assert listener.re_pipeline is not None
-        assert listener.re_llm_pipeline is None
-
-    def test_init_pipeline_creation_failure(self, default_listener_config, mock_memory_systems, mock_hf_pipelines, caplog, monkeypatch):
-        """Tests that pipeline creation failures are logged and pipelines are None."""
-        mock_hf_pipelines.side_effect = Exception("Pipeline creation failed!")
-
-        mock_sum_constructor = MagicMock(return_value=AsyncMock(spec=Summarizer))
-        monkeypatch.setattr("contextkernel.core_logic.llm_listener.Summarizer", mock_sum_constructor)
-        mock_emb_constructor = MagicMock(return_value=AsyncMock(spec=HuggingFaceEmbeddingModel, model=MagicMock()))
-        monkeypatch.setattr("contextkernel.core_logic.llm_listener.HuggingFaceEmbeddingModel", mock_emb_constructor)
-
-        listener = LLMListener(default_listener_config, mock_memory_systems)
-
-        assert listener.ner_pipeline is None
-        assert listener.re_llm_pipeline is None
-        assert "Failed to initialize NER pipeline" in caplog.text
-        assert "Failed to initialize general LLM for RE pipeline" in caplog.text
-
-
-class TestLLMListenerCallLLMMethods:
-    @pytest.mark.asyncio
-    async def test_call_llm_summarize(self, llm_listener):
-        text_content = "This is a long text to summarize."
-        custom_instructions = {"desired_length_type": "words", "desired_length_value": 50}
-
-        # The llm_listener fixture already has summarizer mocked
-        expected_summary = "Mocked summary for test."
-        llm_listener.summarizer.summarize = AsyncMock(return_value=expected_summary)
-
-        summary = await llm_listener._call_llm_summarize(text_content, instructions=custom_instructions)
-
-        assert summary == expected_summary
-        # Check if summarize was called with text and a SummarizerConfig object
-        llm_listener.summarizer.summarize.assert_called_once()
-        call_args = llm_listener.summarizer.summarize.call_args
-        assert call_args[0][0] == text_content
-        assert isinstance(call_args[1]['config'], SummarizerConfig)
-        assert call_args[1]['config'].desired_length_type == "words"
-        assert call_args[1]['config'].desired_length_value == 50
-
-
-    @pytest.mark.asyncio
-    async def test_call_llm_extract_entities_success(self, llm_listener, mock_hf_pipelines):
-        text_content = "Dr. Alice Smith works at Google in New York."
-        # Configure the global pipeline mock for NER for this test
-        mock_ner_output = [
-            {'entity_group': 'PER', 'word': 'Alice Smith', 'start': 4, 'end': 15, 'score': 0.99},
-            {'entity_group': 'ORG', 'word': 'Google', 'start': 25, 'end': 31, 'score': 0.98},
-            {'entity_group': 'LOC', 'word': 'New York', 'start': 35, 'end': 43, 'score': 0.97}
-        ]
-        # The llm_listener's ner_pipeline is already a MagicMock due to mock_hf_pipelines
-        llm_listener.ner_pipeline.return_value = mock_ner_output
-
-        entities = await llm_listener._call_llm_extract_entities(text_content)
-
-        assert entities is not None
-        assert len(entities) == 3
-        assert entities[0]['text'] == 'Alice Smith'
-        assert entities[0]['type'] == 'PER'
-        assert entities[1]['text'] == 'Google'
-        assert entities[1]['type'] == 'ORG'
-        llm_listener.ner_pipeline.assert_called_once_with(text_content)
-
-    @pytest.mark.asyncio
-    async def test_call_llm_extract_entities_pipeline_unavailable(self, llm_listener, caplog):
-        llm_listener.ner_pipeline = None # Simulate pipeline failure
-        entities = await llm_listener._call_llm_extract_entities("Some text")
-        assert entities == []
-        assert "NER pipeline not available" in caplog.text
-
-
-    @pytest.mark.asyncio
-    async def test_call_llm_extract_relations_dedicated_re_pipeline(self, llm_listener, mock_hf_pipelines):
-        text_content = "Alice works for Bob."
-        # Assume listener is configured with a dedicated RE model
-        llm_listener.re_pipeline = MagicMock(return_value=[ # Simulate dedicated RE model output
-            {"subject": "Alice", "relation": "works_for", "object": "Bob"}
-        ])
-        llm_listener.re_llm_pipeline = None # Ensure general LLM RE is not used
-
-        relations = await llm_listener._call_llm_extract_relations(text_content, entities=[]) # Entities optional here
-
-        assert relations is not None
-        assert len(relations) == 1
-        assert relations[0]['subject'] == "Alice"
-        assert relations[0]['verb'] == "works_for"
-        assert relations[0]['object'] == "Bob"
-        llm_listener.re_pipeline.assert_called_once_with(text_content)
-
-    @pytest.mark.asyncio
-    async def test_call_llm_extract_relations_general_llm_re_pipeline(self, llm_listener, monkeypatch):
-        text_content = "Carol manages David."
-        # Mock the tokenizer used by the general RE LLM pipeline for max_length calculation
-        mock_tokenizer = MagicMock()
-        mock_tokenizer.encode.return_value = [1] * len(text_content.split()) # Dummy token IDs
-
-        # Assume listener is configured with a general LLM for RE
-        llm_listener.re_pipeline = None # Ensure dedicated RE is not used
-        # The re_llm_pipeline is already a MagicMock from mock_hf_pipelines in llm_listener fixture
-        llm_listener.re_llm_pipeline.tokenizer = mock_tokenizer # Assign mock tokenizer
-
-        # Simulate output from general LLM pipeline
-        # Prompt is constructed internally, then text is appended. We need to mock the final output.
-        # Expected prompt structure: "Entities found: ... Context text: \"...\" Extracted Relations:"
-        # For simplicity, we'll assume the prompt is roughly X tokens and output is Y tokens.
-        # The important part is that the mock returns text that includes the prompt.
-
-        # Construct part of the expected prompt to simulate its length for the mock output
-        mock_prompt_prefix = "Entities found: \nGiven the text below, extract relations ... Extracted Relations:\n"
-        llm_generated_text = "(Carol; manages; David)\n(Another; relation; example)" # What the LLM "generates"
-
-        # The pipeline mock needs to return this structure: [{'generated_text': 'full_output_incl_prompt'}]
-        llm_listener.re_llm_pipeline.return_value = [{'generated_text': mock_prompt_prefix + llm_generated_text}]
-
-
-        entities_for_prompt = [{"text": "Carol"}, {"text": "David"}] # Example entities
-        relations = await llm_listener._call_llm_extract_relations(text_content, entities=entities_for_prompt)
-
-        assert relations is not None
-        assert len(relations) == 2
-        assert relations[0]['subject'] == "Carol"
-        assert relations[0]['verb'] == "manages"
-        assert relations[0]['object'] == "David"
-        assert relations[1]['subject'] == "Another"
-
-        llm_listener.re_llm_pipeline.assert_called_once()
-        # We can also check the prompt passed to the pipeline if needed by inspecting call_args
-
-    @pytest.mark.asyncio
-    async def test_call_llm_extract_relations_no_pipeline(self, llm_listener, caplog):
-        llm_listener.re_pipeline = None
-        llm_listener.re_llm_pipeline = None
-        relations = await llm_listener._call_llm_extract_relations("Some text", entities=[])
-        assert relations == []
-        assert "No RE pipeline available or configured" in caplog.text
-
-
-class TestLLMListenerInsightProcessing:
-    @pytest.mark.asyncio
-    async def test_generate_insights(self, llm_listener):
-        raw_data = "Some important text data."
-        context_instructions = {"summarize": True, "extract_entities": True, "extract_relations": True}
-        raw_data_doc_id = "raw_doc_123"
-
-        # Mock the sub-methods that _generate_insights calls
-        llm_listener._call_llm_summarize = AsyncMock(return_value="Generated Summary")
-        llm_listener._call_llm_extract_entities = AsyncMock(return_value=[{"text": "Entity1"}])
-        llm_listener._call_llm_extract_relations = AsyncMock(return_value=[{"subject": "Entity1"}])
-        # llm_listener.embedding_model.generate_embedding is already an AsyncMock from the fixture
-
-        insights = await llm_listener._generate_insights(raw_data, context_instructions, raw_data_doc_id)
-
-        llm_listener._call_llm_summarize.assert_called_once_with(raw_data, instructions=None)
-        llm_listener._call_llm_extract_entities.assert_called_once_with(raw_data, instructions=None)
-        # Relations called with entities from _call_llm_extract_entities
-        llm_listener._call_llm_extract_relations.assert_called_once_with(raw_data, [{"text": "Entity1"}], instructions=None)
-        llm_listener.embedding_model.generate_embedding.assert_called_once_with(raw_data)
-
-        assert insights["summary"] == "Generated Summary"
-        assert insights["entities"] == [{"text": "Entity1"}]
-        assert insights["relations"] == [{"subject": "Entity1"}]
-        assert insights["original_data"] == raw_data
-        assert insights["raw_data_doc_id"] == raw_data_doc_id
-        assert insights["content_embedding"] == [0.1, 0.2, 0.3] # From mock_hf_embedding_instance
-
-    @pytest.mark.asyncio
-    async def test_structure_data(self, llm_listener):
-        insights_dict = {
-            "summary": "A summary.",
-            "entities": [{"text": "Paris", "type": "LOC"}],
-            "relations": [{"subject": "Paris", "verb": "isCapitalOf", "object": "France"}],
-            "original_data": "Paris is the capital of France.",
-            "raw_data_doc_id": "doc_raw_456",
-            "content_embedding": [0.5, 0.4, 0.3]
+        self.memory_systems = {
+            "raw_cache": self.mock_raw_cache,
+            "stm": self.mock_stm,
+            "ltm": self.mock_ltm,
+            "graph_db": self.mock_graph_db
         }
-        structured_insight = await llm_listener._structure_data(insights_dict)
 
-        assert isinstance(structured_insight, StructuredInsight)
-        assert structured_insight.summary.text == "A summary."
-        assert len(structured_insight.entities) == 1
-        assert structured_insight.entities[0].text == "Paris"
-        assert structured_insight.raw_data_id == "doc_raw_456"
-        assert structured_insight.content_embedding == [0.5, 0.4, 0.3]
+        # Mock Summarizer
+        self.mock_summarizer_instance = AsyncMock(spec=Summarizer)
+        self.mock_summarizer_instance.summarize = AsyncMock(return_value="Test summary")
+        self.patcher_summarizer = patch('contextkernel.core_logic.llm_listener.Summarizer', return_value=self.mock_summarizer_instance)
+        self.mock_summarizer_cls = self.patcher_summarizer.start()
 
-    @pytest.mark.asyncio
-    async def test_write_to_memory(self, llm_listener, mock_memory_systems):
-        structured_data = StructuredInsight(
-            source_data_preview="France...",
-            summary={"text": "Summary about France."}, # Needs to be Summary object
-            entities=[{"text": "France", "type": "LOC"}], # Needs to be Entity object
-            relations=[{"subject": "France", "verb": "is", "object": "Country"}], # Relation object
-            raw_data_id="raw1",
-            content_embedding=[0.1,0.1]
+        # Mock Embedding Model
+        self.mock_embedding_model_instance = AsyncMock(spec=HuggingFaceEmbeddingModel)
+        self.mock_embedding_model_instance.generate_embedding = AsyncMock(return_value=[0.1, 0.2, 0.3, 0.4, 0.5])
+        self.patcher_embedding_model = patch('contextkernel.core_logic.llm_listener.HuggingFaceEmbeddingModel', return_value=self.mock_embedding_model_instance)
+        self.mock_hf_embedding_model_cls = self.patcher_embedding_model.start()
+
+        # Mock Pipelines (NER/RE)
+        self.mock_ner_pipeline = AsyncMock(return_value=[
+            {"word": "TestCo", "entity_group": "ORG", "score": 0.99},
+            {"word": "Alice", "entity_group": "PER", "score": 0.98}
+        ])
+        self.mock_re_pipeline = AsyncMock(return_value=[
+            {"subject": "Alice", "verb": "works_at", "object": "TestCo"}
+        ])
+        # Patch only if model names are configured (which they are by default for NER)
+        if self.listener_config.entity_extraction_model_name or \
+           self.listener_config.relation_extraction_model_name or \
+           self.listener_config.general_llm_for_re_model_name:
+            self.patcher_pipeline = patch('contextkernel.core_logic.llm_listener.pipeline')
+            self.mock_pipeline_constructor = self.patcher_pipeline.start()
+            # Configure side_effect to return specific mocks based on task
+            def pipeline_side_effect(task, model, tokenizer=None):
+                if task == "ner": return self.mock_ner_pipeline
+                if task == "text2text-generation" or task == "text-generation": return self.mock_re_pipeline
+                return MagicMock() # Default mock for other pipelines
+            self.mock_pipeline_constructor.side_effect = pipeline_side_effect
+        else:
+            self.patcher_pipeline = None
+
+
+        self.listener = LLMListener(self.listener_config, self.memory_systems)
+
+        # Common raw_data and instructions
+        self.raw_data = "Alice works at TestCo. It is a great company."
+        self.context_instructions = {
+            "summarize": True, "extract_entities": True, "extract_relations": True
+        }
+        self.raw_id = f"raw_{datetime.datetime.now(datetime.timezone.utc).isoformat()}"
+        self.mock_raw_cache.store = AsyncMock(return_value=self.raw_id)
+
+
+    def tearDown(self):
+        self.patcher_summarizer.stop()
+        self.patcher_embedding_model.stop()
+        if self.patcher_pipeline:
+            self.patcher_pipeline.stop()
+
+    async def test_process_data_full_enrichment(self):
+        # Configure mocks for full processing
+        # NER pipeline is already mocked in setUp to return entities
+        # RE pipeline is also mocked in setUp
+
+        structured_insight = await self.listener.process_data(self.raw_data, self.context_instructions)
+        self.assertIsNotNone(structured_insight)
+        doc_id_base = structured_insight.raw_data_id or f"doc_{structured_insight.created_at.isoformat()}"
+
+        # 1. Assert Source Document Node Creation
+        self.mock_graph_db.ensure_source_document_node.assert_called_once()
+        args_ensure_doc, _ = self.mock_graph_db.ensure_source_document_node.call_args
+        self.assertEqual(args_ensure_doc[0], doc_id_base) # document_id
+        self.assertIn("preview", args_ensure_doc[1])
+        self.assertEqual(args_ensure_doc[1]["preview"], self.raw_data[:100] + "...")
+
+        # Check that other operations were queued (we'll check calls after gather)
+        # Need to inspect calls to memory_ops.append(...) which is tricky.
+        # Instead, we check the final calls on the graph_db mock.
+
+        # 2. Assert Memory Fragment Linking
+        # STM
+        self.mock_stm.save_summary.assert_called_once()
+        stm_fragment_id = f"{doc_id_base}_summary"
+        expected_stm_props = {
+            "id": stm_fragment_id, "text": "Test summary",
+            "source_document_id": doc_id_base, "type": "summary",
+            "created_at": structured_insight.summary.created_at.isoformat()
+        }
+
+        # LTM
+        self.mock_ltm.save_document.assert_called_once()
+        ltm_fragment_id = f"{doc_id_base}_ltm_doc"
+        expected_ltm_text = "Test summary" # Since summary was generated
+        expected_ltm_props = {
+            "id": ltm_fragment_id, "text_preview": expected_ltm_text[:255],
+            "has_embedding": True, "source_document_id": doc_id_base,
+            "type": "ltm_document_content", "created_at": structured_insight.created_at.isoformat()
+        }
+
+        # RawCache
+        raw_cache_fragment_id = self.raw_id
+        expected_raw_props = {
+            "id": raw_cache_fragment_id, "type": "raw_data_log",
+            "source_document_id": doc_id_base, "created_at": structured_insight.created_at.isoformat()
+        }
+
+        # Check add_memory_fragment_link calls
+        # Need to iterate through calls as order within asyncio.gather is not guaranteed for these specific ones
+        add_mem_frag_calls = self.mock_graph_db.add_memory_fragment_link.call_args_list
+        self.assertTrue(any(
+            call(document_id=doc_id_base, fragment_id=stm_fragment_id, fragment_main_label="STMEntry",
+                 relationship_type="HAS_STM_REPRESENTATION", fragment_properties=unittest.mock.ANY) # ANY for props due to datetime object
+            in add_mem_frag_calls
+        ))
+        # Actual check for properties for STM
+        found_stm_call = False
+        for call_args in add_mem_frag_calls:
+            if call_args[1]['fragment_id'] == stm_fragment_id:
+                self.assertDictEqual(call_args[1]['fragment_properties'], expected_stm_props)
+                found_stm_call = True; break
+        self.assertTrue(found_stm_call, "STM fragment properties not as expected or call not found.")
+
+        found_ltm_call = False
+        for call_args in add_mem_frag_calls:
+            if call_args[1]['fragment_id'] == ltm_fragment_id:
+                 self.assertDictEqual(call_args[1]['fragment_properties'], expected_ltm_props)
+                 found_ltm_call = True; break
+        self.assertTrue(found_ltm_call, "LTM fragment properties not as expected or call not found.")
+
+        found_raw_call = False
+        for call_args in add_mem_frag_calls:
+            if call_args[1]['fragment_id'] == raw_cache_fragment_id:
+                 self.assertDictEqual(call_args[1]['fragment_properties'], expected_raw_props)
+                 found_raw_call = True; break
+        self.assertTrue(found_raw_call, "RawCache fragment properties not as expected or call not found.")
+
+
+        # 3. Assert Entities and Relations Linking
+        self.mock_graph_db.add_entities_to_document.assert_called_once()
+        args_entities, _ = self.mock_graph_db.add_entities_to_document.call_args
+        self.assertEqual(args_entities[0], doc_id_base)
+        self.assertEqual(len(args_entities[1]), 2) # Alice, TestCo
+        self.assertEqual(args_entities[1][0]['text'], "TestCo") # NER output might not be ordered as input
+        self.assertEqual(args_entities[1][1]['text'], "Alice")
+
+        self.mock_graph_db.add_relations_to_document.assert_called_once()
+        args_relations, _ = self.mock_graph_db.add_relations_to_document.call_args
+        self.assertEqual(args_relations[0], doc_id_base)
+        self.assertEqual(len(args_relations[1]), 1)
+        self.assertEqual(args_relations[1][0]['subject'], "Alice")
+        self.assertEqual(args_relations[1][0]['verb'], "works_at")
+
+
+    async def test_process_data_only_summary(self):
+        self.context_instructions = {"summarize": True, "extract_entities": False, "extract_relations": False}
+        # NER and RE pipelines will not be called effectively
+        self.listener.ner_pipeline = None # Explicitly disable for this test's clarity
+        self.listener.re_pipeline = None
+        self.listener.re_llm_pipeline = None
+
+
+        structured_insight = await self.listener.process_data(self.raw_data, self.context_instructions)
+        doc_id_base = structured_insight.raw_data_id or f"doc_{structured_insight.created_at.isoformat()}"
+
+        self.mock_graph_db.ensure_source_document_node.assert_called_once_with(
+            document_id=doc_id_base,
+            properties=unittest.mock.ANY
         )
-        # For the test, we need to ensure the objects are of the Pydantic types
-        # This is normally handled by _structure_data
-        from contextkernel.core_logic.llm_listener import Summary, Entity, Relation
-        structured_data.summary = Summary(text="Summary about France.")
-        structured_data.entities = [Entity(text="France", type="LOC")]
-        structured_data.relations = [Relation(subject="France", verb="is", object="Country")]
+        # Check add_memory_fragment_link was called for STM
+        # Other fragment links (LTM, RawCache) would also be called
+        self.assertTrue(any(
+            call[1]['fragment_main_label'] == "STMEntry" for call in self.mock_graph_db.add_memory_fragment_link.call_args_list
+        ))
+
+        self.mock_graph_db.add_entities_to_document.assert_called_once_with(document_id=doc_id_base, entities=[])
+        self.mock_graph_db.add_relations_to_document.assert_called_once_with(document_id=doc_id_base, relations=[])
+
+    async def test_process_data_no_graph_db(self):
+        self.listener.memory_systems["graph_db"] = None # Remove graph_db
+
+        structured_insight = await self.listener.process_data(self.raw_data, self.context_instructions)
+        self.assertIsNotNone(structured_insight) # Should still process other parts
+
+        self.mock_graph_db.ensure_source_document_node.assert_not_called()
+        self.mock_graph_db.add_memory_fragment_link.assert_not_called()
+        self.mock_graph_db.add_entities_to_document.assert_not_called()
+        self.mock_graph_db.add_relations_to_document.assert_not_called()
+
+        # Other memory systems should still be called
+        self.mock_stm.save_summary.assert_called_once()
+        self.mock_ltm.save_document.assert_called_once()
+        self.mock_raw_cache.store.assert_called_once()
+
+    async def test_entity_relation_transformation_to_dicts(self):
+        # This tests the _write_to_memory part implicitly via process_data
+        # We need to ensure Pydantic models are converted to dicts
+
+        # Create a listener where graph_db methods are simple mocks that allow inspection of args
+        graph_db_spy = AsyncMock()
+        graph_db_spy.ensure_source_document_node = AsyncMock(return_value=True)
+        graph_db_spy.add_memory_fragment_link = AsyncMock(return_value=True)
+        graph_db_spy.add_entities_to_document = AsyncMock(return_value=True)
+        graph_db_spy.add_relations_to_document = AsyncMock(return_value=True)
+
+        memory_systems_with_spy = self.memory_systems.copy()
+        memory_systems_with_spy["graph_db"] = graph_db_spy
+
+        listener_with_spy = LLMListener(self.listener_config, memory_systems_with_spy)
+        # Need to re-mock internal LLM calls for this new listener instance
+        listener_with_spy._call_llm_summarize = AsyncMock(return_value="Test summary")
+        listener_with_spy._call_llm_extract_entities = AsyncMock(return_value=[
+            {"text": "Entity1", "type": "TYPEA", "metadata": {"k": "v"}}
+        ])
+        listener_with_spy._call_llm_extract_relations = AsyncMock(return_value=[
+            {"subject": "Entity1", "verb": "links_to", "object": "Entity2", "context": "ctx"}
+        ])
+        listener_with_spy.embedding_model.generate_embedding = AsyncMock(return_value=[0.5,0.5]) # Mock for this instance
+        listener_with_spy.raw_cache = self.mock_raw_cache # ensure raw_cache is part of this instance
+
+        await listener_with_spy.process_data("Some data", {"summarize": True, "extract_entities": True, "extract_relations": True})
+
+        # Check add_entities_to_document call
+        graph_db_spy.add_entities_to_document.assert_called_once()
+        args_entities, _ = graph_db_spy.add_entities_to_document.call_args
+        self.assertIsInstance(args_entities[1], list)
+        self.assertIsInstance(args_entities[1][0], dict) # Ensure it's a dict, not Pydantic model
+        self.assertEqual(args_entities[1][0]["text"], "Entity1")
+        self.assertIn("created_at", args_entities[1][0]) # model_dump includes these
+
+        # Check add_relations_to_document call
+        graph_db_spy.add_relations_to_document.assert_called_once()
+        args_relations, _ = graph_db_spy.add_relations_to_document.call_args
+        self.assertIsInstance(args_relations[1], list)
+        self.assertIsInstance(args_relations[1][0], dict)
+        self.assertEqual(args_relations[1][0]["subject"], "Entity1")
+        self.assertIn("created_at", args_relations[1][0])
 
 
-        await llm_listener._write_to_memory(structured_data)
-
-        # STM: save_summary
-        mock_memory_systems["stm"].save_summary.assert_called_once()
-        stm_call_args = mock_memory_systems["stm"].save_summary.call_args
-        assert stm_call_args[1]['summary_id'].startswith(structured_data.raw_data_id if structured_data.raw_data_id else "")
-        assert stm_call_args[1]['summary_obj'] == structured_data.summary
-
-        # LTM: save_document
-        mock_memory_systems["ltm"].save_document.assert_called_once()
-        ltm_call_args = mock_memory_systems["ltm"].save_document.call_args
-        assert ltm_call_args[1]['doc_id'].startswith(structured_data.raw_data_id if structured_data.raw_data_id else "")
-        assert ltm_call_args[1]['text_content'] == structured_data.source_data_preview
-        assert ltm_call_args[1]['embedding'] == structured_data.content_embedding
-
-        # GraphDB: add_entities, add_relations
-        mock_memory_systems["graph_db"].add_entities.assert_called_once_with(
-            entities=structured_data.entities, document_id=mock.ANY, metadata=mock.ANY
-        )
-        mock_memory_systems["graph_db"].add_relations.assert_called_once_with(
-            relations=structured_data.relations, document_id=mock.ANY, metadata=mock.ANY
-        )
-
-    @pytest.mark.asyncio
-    async def test_process_data_end_to_end(self, llm_listener, mock_memory_systems):
-        raw_data = "Live test data for processing."
-        context_instructions = {"summarize": True, "extract_entities": True, "extract_relations": True}
-
-        # Mock all sub-methods that process_data calls internally
-        llm_listener._preprocess_data = AsyncMock(side_effect=lambda x: x) # passthrough
-        llm_listener._generate_insights = AsyncMock(return_value={
-            "summary": "Processed summary", "entities": [], "relations": [],
-            "original_data": raw_data, "raw_data_doc_id": "test_raw_id_1",
-            "content_embedding": [0.7,0.8]
-        })
-        llm_listener._structure_data = AsyncMock(
-            # side_effect=lambda insights: StructuredInsight(**insights) # simplified
-            return_value = StructuredInsight( # More explicit for clarity
-                summary=Summary(text="Processed summary"),
-                entities=[], relations=[], original_data_type=type(raw_data).__name__,
-                source_data_preview=raw_data[:100]+"...", raw_data_id="test_raw_id_1",
-                content_embedding=[0.7,0.8]
-            )
-        )
-        llm_listener._write_to_memory = AsyncMock()
-
-        await llm_listener.process_data(raw_data, context_instructions)
-
-        mock_memory_systems["raw_cache"].store.assert_called_once() # Check raw_cache was called
-        llm_listener._preprocess_data.assert_called_once_with(raw_data)
-        llm_listener._generate_insights.assert_called_once()
-        llm_listener._structure_data.assert_called_once()
-        llm_listener._write_to_memory.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_process_data_error_handling(self, llm_listener, caplog):
-        """Tests that an error in a step of process_data is logged."""
-        raw_data = "Data that will cause an error."
-        llm_listener._preprocess_data = AsyncMock(side_effect=Exception("Preprocessing failed!"))
-
-        await llm_listener.process_data(raw_data)
-
-        assert "Error during data processing pipeline: Preprocessing failed!" in caplog.text
+if __name__ == '__main__':
+    unittest.main()

@@ -173,9 +173,11 @@ class LLMListener:
         if data.strip() and self.embedding_model:
             try: embedding = await self.embedding_model.generate_embedding(data)
             except EmbeddingError as e: self.logger.error(f"Content embedding failed: {e}", exc_info=True) # Non-critical
+        self.logger.info("Generating insights (summary, entities, relations, embedding) to structure the data.")
         return {"summary": summary, "entities": entities, "relations": relations, "original_data": data, "raw_data_doc_id": raw_id, "content_embedding": embedding}
 
     async def _structure_data(self, insights: Dict[str, Any]) -> StructuredInsight:
+        self.logger.info("Packaging insights into StructuredInsight.")
         return StructuredInsight(
             original_data_type=type(insights.get("original_data")).__name__,
             source_data_preview=insights.get("original_data", "")[:100] + "...",
@@ -186,22 +188,151 @@ class LLMListener:
             content_embedding=insights.get("content_embedding"))
 
     async def _write_to_memory(self, structured_data: StructuredInsight) -> None:
-        doc_id_base = structured_data.raw_data_id or structured_data.created_at.isoformat()
-        ops = []
-        if structured_data.summary and "stm" in self.memory_systems:
-            ops.append(self.memory_systems["stm"].save_summary(summary_id=f"{doc_id_base}_summary", summary_obj=structured_data.summary, metadata={"doc_id_base": doc_id_base, "raw_data_id": structured_data.raw_data_id}))
-        if "ltm" in self.memory_systems and (s_prev := structured_data.source_data_preview or (structured_data.summary and structured_data.summary.text)):
-            ops.append(self.memory_systems["ltm"].save_document(doc_id=f"{doc_id_base}_ltm", text_content=s_prev, embedding=structured_data.content_embedding or [], metadata={"doc_id_base": doc_id_base, "raw_data_id": structured_data.raw_data_id}))
-        if "graph_db" in self.memory_systems:
-            if structured_data.entities: ops.append(self.memory_systems["graph_db"].add_entities(entities=structured_data.entities, document_id=doc_id_base, metadata={"raw_data_id": structured_data.raw_data_id}))
-            if structured_data.relations: ops.append(self.memory_systems["graph_db"].add_relations(relations=structured_data.relations, document_id=doc_id_base, metadata={"raw_data_id": structured_data.raw_data_id}))
+        self.logger.info(f"Persisting structured insights (Raw ID: {structured_data.raw_data_id or 'N/A'}) and enriching graph using new GraphDB methods.")
+        doc_id_base = structured_data.raw_data_id or f"doc_{structured_data.created_at.isoformat()}"
         
-        results = await asyncio.gather(*ops, return_exceptions=True)
-        for i, res in enumerate(results):
-            if isinstance(res, Exception): self.logger.error(f"Memory op {i} failed: {res}", exc_info=res); raise MemoryAccessError(f"Memory operation failed: {res}") from res
+        memory_ops = []
+
+        # Standard memory operations (STM, LTM) - these remain largely the same
+        stm_system = self.memory_systems.get("stm")
+        if structured_data.summary and stm_system:
+            self.logger.debug(f"Queueing STM save for summary of {doc_id_base}")
+            stm_summary_id = f"{doc_id_base}_summary"
+            memory_ops.append(stm_system.save_summary(
+                summary_id=stm_summary_id,
+                summary_obj=structured_data.summary,
+                metadata={
+                    "doc_id_base": doc_id_base,
+                    "raw_data_id": structured_data.raw_data_id,
+                    "source_preview": structured_data.source_data_preview,
+                    "type": "summary" # Added type for clarity
+                }
+            ))
+
+        ltm_content = structured_data.source_data_preview
+        if structured_data.summary and structured_data.summary.text:
+            ltm_content = structured_data.summary.text
+
+        ltm_system = self.memory_systems.get("ltm")
+        if ltm_system and ltm_content:
+            self.logger.debug(f"Queueing LTM save for document {doc_id_base}")
+            ltm_doc_id = f"{doc_id_base}_ltm_doc"
+            memory_ops.append(ltm_system.save_document(
+                doc_id=ltm_doc_id,
+                text_content=ltm_content,
+                embedding=structured_data.content_embedding or [],
+                metadata={
+                    "doc_id_base": doc_id_base,
+                    "raw_data_id": structured_data.raw_data_id,
+                    "original_data_type": structured_data.original_data_type,
+                    "type": "document_content" # Added type for clarity
+                }
+            ))
+
+        # Graph enrichment operations using new GraphDB methods
+        graph_db = self.memory_systems.get("graph_db")
+        if graph_db:
+            self.logger.info(f"Starting graph enrichment for SourceDocument ID: {doc_id_base} using new methods.")
+
+            source_doc_props = {
+                "raw_data_id": structured_data.raw_data_id,
+                "preview": structured_data.source_data_preview,
+                "original_data_type": structured_data.original_data_type,
+                "created_at": structured_data.created_at.isoformat(),
+                "updated_at": structured_data.updated_at.isoformat() # Assuming GraphDB methods handle internal updated_at
+            }
+            # Ensure SourceDocument node is created first as other operations depend on it.
+            # This call is awaitable and should complete before subsequent graph ops are queued if they depend on it.
+            try:
+                await graph_db.ensure_source_document_node(document_id=doc_id_base, properties=source_doc_props)
+                self.logger.info(f"SourceDocument node ensured for ID: {doc_id_base}")
+
+                # Link STM entry if summary exists
+                if structured_data.summary and stm_system: # Check stm_system as well, though save_summary is already conditional
+                    stm_fragment_id = f"{doc_id_base}_summary" # Consistent with save_summary id
+                    stm_node_props = {
+                        "id": stm_fragment_id, # Store its own ID
+                        "text": structured_data.summary.text,
+                        "source_document_id": doc_id_base, # Link back to source
+                        "type": "summary",
+                        "created_at": structured_data.summary.created_at.isoformat()
+                    }
+                    memory_ops.append(graph_db.add_memory_fragment_link(
+                        document_id=doc_id_base,
+                        fragment_id=stm_fragment_id,
+                        fragment_main_label="STMEntry",
+                        relationship_type="HAS_STM_REPRESENTATION",
+                        fragment_properties=stm_node_props
+                    ))
+                    self.logger.debug(f"Queueing STMEntry link for {stm_fragment_id} to {doc_id_base}")
+
+                # Link LTM entry
+                if ltm_system and ltm_content: # Check ltm_system as well
+                    ltm_fragment_id = f"{doc_id_base}_ltm_doc" # Consistent with save_document id
+                    ltm_node_props = {
+                        "id": ltm_fragment_id,
+                        "text_preview": ltm_content[:255], # Store a preview in graph, full content in LTM system
+                        "has_embedding": bool(structured_data.content_embedding),
+                        "source_document_id": doc_id_base,
+                        "type": "ltm_document_content",
+                        "created_at": structured_data.created_at.isoformat() # Use main insight's timestamp
+                    }
+                    memory_ops.append(graph_db.add_memory_fragment_link(
+                        document_id=doc_id_base,
+                        fragment_id=ltm_fragment_id,
+                        fragment_main_label="LTMLogEntry",
+                        relationship_type="HAS_LTM_REPRESENTATION",
+                        fragment_properties=ltm_node_props
+                    ))
+                    self.logger.debug(f"Queueing LTMLogEntry link for {ltm_fragment_id} to {doc_id_base}")
+
+                # Link Raw Cache entry if raw_data_id exists
+                if structured_data.raw_data_id: # raw_data_id is the ID for RawCacheEntry
+                    raw_cache_node_props = {
+                        "id": structured_data.raw_data_id,
+                        "type": "raw_data_log",
+                        "source_document_id": doc_id_base,
+                         "created_at": structured_data.created_at.isoformat() # Assuming same creation time
+                    }
+                    memory_ops.append(graph_db.add_memory_fragment_link(
+                        document_id=doc_id_base,
+                        fragment_id=structured_data.raw_data_id,
+                        fragment_main_label="RawCacheEntry",
+                        relationship_type="REFERENCES_RAW_CACHE", # Or HAS_RAW_CACHE_REPRESENTATION
+                        fragment_properties=raw_cache_node_props
+                    ))
+                    self.logger.debug(f"Queueing RawCacheEntry link for {structured_data.raw_data_id} to {doc_id_base}")
+
+                # Add entities, linking them to doc_id_base
+                if structured_data.entities:
+                    entities_as_dicts = [entity.model_dump(exclude_none=True) for entity in structured_data.entities]
+                    memory_ops.append(graph_db.add_entities_to_document(document_id=doc_id_base, entities=entities_as_dicts))
+                    self.logger.debug(f"Queueing {len(entities_as_dicts)} entities for document {doc_id_base}")
+
+                # Add relations, linking them to doc_id_base (implicitly via entities)
+                if structured_data.relations:
+                    relations_as_dicts = [relation.model_dump(exclude_none=True) for relation in structured_data.relations]
+                    memory_ops.append(graph_db.add_relations_to_document(document_id=doc_id_base, relations=relations_as_dicts))
+                    self.logger.debug(f"Queueing {len(relations_as_dicts)} relations for document {doc_id_base}")
+
+            except Exception as e_graph_init: # Catch error from ensure_source_document_node
+                self.logger.error(f"GraphDB: Failed to ensure source document node for {doc_id_base}: {e_graph_init}", exc_info=True)
+                # Potentially raise MemoryAccessError here if this is critical
+
+        # Execute all queued operations (STM, LTM, and new GraphDB operations)
+        if memory_ops:
+            results = await asyncio.gather(*memory_ops, return_exceptions=True)
+            for i, res in enumerate(results):
+                if isinstance(res, Exception):
+                    self.logger.error(f"Memory op {i} failed: {res}", exc_info=True)
+                    raise MemoryAccessError(f"At least one memory operation failed: {res}") from res
+            self.logger.info(f"All memory operations for {doc_id_base} (STM, LTM, GraphDB links) completed.")
+        else:
+            self.logger.info(f"No memory operations were queued for {doc_id_base}.")
+
 
     async def process_data(self, raw_data: Any, context_instructions: Optional[Dict[str, Any]]=None) -> Optional[StructuredInsight]:
-        self.logger.info(f"Processing data. Instructions: {context_instructions}")
+        self.logger.info(f"Optimizing and structuring raw data. Instructions: {context_instructions}")
         raw_id: Optional[str] = None
         try:
             data_str = await self._preprocess_data(raw_data)

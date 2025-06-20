@@ -49,7 +49,15 @@ class LLMRetrieverConfig(BaseSettings):
     networkx_graph_path: Optional[str] = None
     whoosh_index_dir: Optional[str] = "whoosh_index_path"
     cross_encoder_model_name: Optional[str] = None
-    keyword_search_enabled: bool = True
+    # keyword_search_enabled is effectively replaced by enable_keyword_search for clarity
+    # keyword_search_enabled: bool = True # Old flag
+
+    default_retrieval_strategy: str = "graph_first" # New: graph_first, graph_only, vector_only, keyword_only, all
+    graph_search_top_k: int = 5
+    enable_graph_search: bool = True # Added this flag
+    enable_vector_search: bool = True
+    enable_keyword_search: bool = True
+
 
     model_config = {'env_prefix': 'LLM_RETRIEVER_'} # Pydantic V2 style for pydantic-settings
 
@@ -216,8 +224,8 @@ class LLMRetriever:
         self.whoosh_ix = None
         self.cross_encoder = None
 
-        if not self.retriever_config.embedding_model_name and (self.retriever_config.retrieval_strategy in ["all", "vector_only"] if hasattr(self.retriever_config, 'retrieval_strategy') else True) : # check if strategy implies embedding use
-             raise ConfigurationError("embedding_model_name is required for retriever if vector search is used.")
+        if not self.retriever_config.embedding_model_name and self.retriever_config.enable_vector_search and self.retriever_config.default_retrieval_strategy not in ["graph_only", "keyword_only"]:
+             raise ConfigurationError("embedding_model_name is required for retriever if vector search is enabled and strategy might use it.")
         try:
             if self.retriever_config.embedding_model_name:
                  self.embedding_model = HuggingFaceEmbeddingModel(model_name=self.retriever_config.embedding_model_name, device=self.retriever_config.embedding_device)
@@ -225,7 +233,7 @@ class LLMRetriever:
         except (EmbeddingError, ConfigurationError) as e:
             self.logger.error(f"Retriever: Embedding model init failed: {e}", exc_info=True); raise
 
-        if self.retriever_config.keyword_search_enabled:
+        if self.retriever_config.enable_keyword_search: # Updated from keyword_search_enabled
             if not (Schema and QueryParser and ID and TEXT and create_in and open_dir and exists_in):
                 raise ConfigurationError("Whoosh library not fully available, but keyword search enabled.")
             if not self.retriever_config.whoosh_index_dir:
@@ -258,11 +266,16 @@ class LLMRetriever:
         
     async def _search_graph_db(self, query: str, task: Optional[str]=None, top_k: int=5, filters: Optional[Dict]=None) -> List[RetrievedItem]:
         if not hasattr(self.graph_db, 'search'): raise ConfigurationError("GraphDB interface missing 'search'.")
-        try: return await self.graph_db.search(query=query, task_description=task, top_k=top_k, filters=filters)
+        self.logger.info(f"Searching GraphDB with query: '{query[:50]}...', top_k={top_k}")
+        try:
+            # Assuming graph_db.search can handle task_description if it's implemented there
+            # For StubGraphDB, task_description is not used in its search method.
+            return await self.graph_db.search(query=query, top_k=top_k, filters=filters) # task_description removed if not used by stub
         except Exception as e: raise MemoryAccessError(f"GraphDB search error: {e}") from e
 
     async def _search_keyword(self, query: str, top_k: int=5, filters: Optional[Dict]=None) -> List[RetrievedItem]:
-        if not (self.retriever_config.keyword_search_enabled and self.whoosh_ix): return []
+        if not (self.retriever_config.enable_keyword_search and self.whoosh_ix): return [] # Updated from keyword_search_enabled
+        self.logger.info(f"Searching Keyword (Whoosh) with query: '{query[:50]}...', top_k={top_k}")
         try:
             with self.whoosh_ix.searcher() as searcher:
                 q = QueryParser("content", schema=self.whoosh_ix.schema).parse(query)
@@ -290,40 +303,102 @@ class LLMRetriever:
             except Exception as e: self.logger.error(f"CrossEncoder re-ranking failed: {e}", exc_info=True); # Non-critical, proceed with original sort
         return sorted_results
 
-    async def retrieve(self, query: str, task_description: Optional[str]=None, top_k: Optional[int]=None, filters: Optional[Dict]=None, retrieval_strategy: str="all") -> RetrievalResponse:
-        start_time, current_top_k = time.time(), top_k or self.retriever_config.default_top_k
-        final_items, errors = [], []
+    async def retrieve(self, query: str, task_description: Optional[str]=None, top_k: Optional[int]=None, filters: Optional[Dict]=None, retrieval_strategy: Optional[str]=None) -> RetrievalResponse:
+        start_time = time.time()
+        current_top_k = top_k or self.retriever_config.default_top_k
+        strategy = retrieval_strategy or self.retriever_config.default_retrieval_strategy
         
-        try: q_embed = await self._preprocess_and_embed_query(query, task_description) if self.embedding_model else []
-        except EmbeddingError as e: q_embed, errors = [], [f"Query embedding failed: {e}"]
+        self.logger.info(f"Retrieving with strategy: {strategy}, query: '{query[:50]}...', top_k: {current_top_k}")
+
+        all_results_from_sources: List[List[RetrievedItem]] = []
+        errors: List[str] = []
+        q_embed: List[float] = []
+
+        if self.embedding_model and strategy not in ["keyword_only", "graph_only_no_embed"]: # graph_only might still use embedding for graph query construction in future
+            try:
+                q_embed = await self._preprocess_and_embed_query(query, task_description)
+            except EmbeddingError as e:
+                errors.append(f"Query embedding failed: {e}")
+                self.logger.error(f"Query embedding failed: {e}")
+                # For strategies that depend on embeddings, we might need to stop or adapt.
+                if strategy in ["vector_only"]: # Or any strategy that *must* have embeddings
+                    return RetrievalResponse(items=[], retrieval_time_ms=(time.time()-start_time)*1000, message=f"Retrieval failed due to embedding error: {e}")
+
+        if strategy == "graph_first":
+            graph_results: List[RetrievedItem] = []
+            try:
+                graph_results = await self._search_graph_db(query, task_description, self.retriever_config.graph_search_top_k, filters)
+                all_results_from_sources.append(graph_results)
+                self.logger.info(f"GraphDB search yielded {len(graph_results)} results.")
+            except MemoryAccessError as e:
+                errors.append(f"GraphDB search failed: {e}")
+                self.logger.error(f"GraphDB search failed: {e}")
+
+            remaining_k = current_top_k - len(graph_results)
+            if remaining_k > 0:
+                secondary_search_coros = []
+                if self.retriever_config.enable_vector_search and q_embed:
+                    secondary_search_coros.append(self._search_vector_store(q_embed, remaining_k, filters))
+                if self.retriever_config.enable_keyword_search:
+                    secondary_search_coros.append(self._search_keyword(query, remaining_k, filters))
+
+                if secondary_search_coros:
+                    gathered_secondary_results = await asyncio.gather(*secondary_search_coros, return_exceptions=True)
+                    for i, res_or_exc in enumerate(gathered_secondary_results):
+                        if isinstance(res_or_exc, Exception):
+                            errors.append(f"Secondary search source {i} failed: {res_or_exc}")
+                        elif res_or_exc:
+                            all_results_from_sources.append(res_or_exc)
+
+        elif strategy == "graph_only":
+            try:
+                graph_results = await self._search_graph_db(query, task_description, current_top_k, filters)
+                all_results_from_sources.append(graph_results)
+            except MemoryAccessError as e:
+                errors.append(f"GraphDB (graph_only) search failed: {e}")
+
+        elif strategy == "vector_only":
+            if self.retriever_config.enable_vector_search and q_embed:
+                try:
+                    vector_results = await self._search_vector_store(q_embed, current_top_k, filters)
+                    all_results_from_sources.append(vector_results)
+                except MemoryAccessError as e: errors.append(f"Vector search (vector_only) failed: {e}")
+            elif not q_embed and self.retriever_config.enable_vector_search:
+                 errors.append("Vector search (vector_only) skipped due to missing query embedding.")
+
+        elif strategy == "keyword_only":
+            if self.retriever_config.enable_keyword_search:
+                try:
+                    keyword_results = await self._search_keyword(query, current_top_k, filters)
+                    all_results_from_sources.append(keyword_results)
+                except MemoryAccessError as e: errors.append(f"Keyword search (keyword_only) failed: {e}")
         
-        task_error_messages: List[str] = [] # Initialize task_error_messages, was missing in original snippet for retrieve
+        elif strategy == "all": # Legacy "all" or explicit "all"
+            search_coros = []
+            if self.retriever_config.enable_graph_search:
+                 search_coros.append(self._search_graph_db(query, task_description, self.retriever_config.graph_search_top_k, filters))
+            if self.retriever_config.enable_vector_search and q_embed:
+                search_coros.append(self._search_vector_store(q_embed, current_top_k, filters)) # current_top_k or a portion?
+            if self.retriever_config.enable_keyword_search:
+                search_coros.append(self._search_keyword(query, current_top_k, filters)) # current_top_k or a portion?
 
-        search_coros = []
-        if retrieval_strategy in ["all", "vector_only"] and q_embed: search_coros.append(self._search_vector_store(q_embed, current_top_k, filters))
-        if retrieval_strategy in ["all", "graph_only"]: search_coros.append(self._search_graph_db(query, task_description, current_top_k, filters))
-        if retrieval_strategy in ["all", "keyword_only"]: search_coros.append(self._search_keyword(query, current_top_k, filters))
+            if search_coros:
+                gathered_results = await asyncio.gather(*search_coros, return_exceptions=True)
+                for i, res_or_exc in enumerate(gathered_results):
+                    if isinstance(res_or_exc, Exception):
+                        errors.append(f"Search source {i} (strategy 'all') failed: {res_or_exc}")
+                    elif res_or_exc:
+                        all_results_from_sources.append(res_or_exc)
+        else:
+            errors.append(f"Unknown retrieval strategy: {strategy}")
 
-        if search_coros:
-            results_from_sources = await asyncio.gather(*search_coros, return_exceptions=True)
-            processed_results: List[List[RetrievedItem]] = []
-            # Combine errors from asyncio.gather (e.g. direct call failures) 
-            # with task_error_messages (e.g. soft errors within search methods if they didn't raise)
-            all_errors = errors # Start with embedding errors
-            for i, res_or_exc in enumerate(results_from_sources):
-                if isinstance(res_or_exc, Exception): 
-                    all_errors.append(f"Search source {i} failed: {res_or_exc}")
-                elif res_or_exc: 
-                    processed_results.append(res_or_exc) # type: ignore
-            
-            # Add any task_error_messages that might have been populated by individual search methods
-            # (though current search methods raise on error, this is for robustness if they change)
-            all_errors.extend(task_error_messages)
+        final_items: List[RetrievedItem] = []
+        if all_results_from_sources:
+            final_items = await self._consolidate_and_rank_results(query, all_results_from_sources, top_k_ce=current_top_k*2) # Pass more to CE if available
+            final_items = final_items[:current_top_k] # Ensure final cut respects top_k
 
-            if processed_results: 
-                final_items = await self._consolidate_and_rank_results(query, processed_results)
-        
-        msg = f"Retrieved {len(final_items)} items." + (f" Errors: {'; '.join(all_errors)}" if all_errors else "")
+        msg = f"Retrieved {len(final_items)} items using strategy '{strategy}'." + (f" Errors: {'; '.join(errors)}" if errors else "")
+        self.logger.info(msg)
         return RetrievalResponse(items=final_items, retrieval_time_ms=(time.time()-start_time)*1000, message=msg)
 
 # Example main (for direct execution if needed)

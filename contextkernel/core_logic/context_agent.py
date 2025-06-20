@@ -31,6 +31,7 @@ class ContextAgentConfig(BaseSettings):
     state_manager_type: str = "in_memory" 
     redis_host: str = "localhost"
     redis_port: int = 6379
+    proactive_enabled: bool = False # New flag for proactive features
 
     model_config = SettingsConfigDict(env_prefix='CONTEXT_AGENT_')
 
@@ -113,7 +114,51 @@ class ContextAgent:
                 self.state_manager = InMemoryStateManager()
         else:
              self.logger.info(f"Using pre-injected StateManager: {type(self.state_manager).__name__}.")
-        self.logger.info(f"ContextAgent fully initialized. spaCy: {self.nlp is not None}. Intent Classifier: {self.intent_classifier is not None}. StateManager: {self.state_manager is not None}.")
+        self.logger.info(f"ContextAgent fully initialized. spaCy: {self.nlp is not None}. Intent Classifier: {self.intent_classifier is not None}. StateManager: {self.state_manager is not None}. Proactive: {self.agent_config.proactive_enabled}")
+
+    # --- Proactive Context Methods START ---
+    async def _detect_latent_intent(self, raw_input: Any, env_signals: TypingOptional[Dict[str, Any]] = None) -> str:
+        self.logger.info(f"Proactive: Detecting latent intent for input: '{str(raw_input)[:100]}', env_signals: {env_signals}")
+        # Placeholder implementation
+        if isinstance(raw_input, str) and "remember this" in raw_input.lower():
+            return "latent_intent_remember_info"
+        return "latent_intent_placeholder"
+
+    async def _proactively_check_memory(self, latent_intent: str) -> TypingOptional[Any]:
+        self.logger.info(f"Proactive: Checking memory for latent_intent: '{latent_intent}'")
+        # Placeholder: Simulate no memory found
+        # In a real scenario, this would query self.llm_service.retriever or similar
+        if latent_intent == "latent_intent_remember_info": # Example
+            # Simulate finding something to avoid triggering creation every time for this specific latent intent
+            # self.logger.info(f"Proactive: Memory found for '{latent_intent}' (simulated).")
+            # return {"simulated_data": "Some previously remembered fact."}
+            pass # Fall through to simulate not found, to test creation trigger
+        return None
+
+    async def _trigger_listener_for_memory_creation(self, latent_intent: str, raw_input: Any) -> TypingOptional[Any]:
+        self.logger.info(f"Proactive: Triggering listener for memory creation. Latent_intent: '{latent_intent}', Input: '{str(raw_input)[:100]}'")
+        # Placeholder: Simulate invoking LLMListener
+        # In a real scenario, this would call self.llm_service.listener.process_data(...)
+        # For now, just log and return a mock confirmation
+        if self.llm_service and hasattr(self.llm_service, 'listener') and hasattr(self.llm_service.listener, 'process_data'):
+            try:
+                # This is a conceptual call, not executing the full listener logic here
+                # await self.llm_service.listener.process_data(raw_data=raw_input, context_instructions={"latent_intent": latent_intent, "action": "store_proactively"})
+                self.logger.info("Proactive: LLMListener process_data would be called here for memory creation.")
+                return {"status": "simulated_memory_created", "latent_intent": latent_intent}
+            except Exception as e:
+                self.logger.error(f"Proactive: Error during simulated listener trigger: {e}", exc_info=True)
+                return None
+        self.logger.warning("Proactive: LLMListener or process_data method not available for memory creation.")
+        return None
+
+    async def _inject_proactive_context(self, retrieved_memory: Any) -> TypingOptional[Dict[str, Any]]:
+        self.logger.info(f"Proactive: Injecting proactive context from retrieved_memory: {str(retrieved_memory)[:100]}")
+        # Placeholder: Format memory for context injection
+        if isinstance(retrieved_memory, dict):
+            return {"proactive_context": retrieved_memory}
+        return {"proactive_context": {"data": retrieved_memory}}
+    # --- Proactive Context Methods END ---
 
     def _initialize_matchers(self):
         if not self.matcher: return
@@ -231,24 +276,76 @@ class ContextAgent:
             if self.state_manager and conversation_id:
                 try:
                     retrieved_state = await self.state_manager.get_state(conversation_id)
-                    if retrieved_state: current_context = {**retrieved_state, **current_context}
+                    if retrieved_state: current_context = {**retrieved_state, **current_context} # existing context can override state
                 except MemoryAccessError as e: self.logger.error(f"State retrieval failed for {conversation_id}: {e}", exc_info=True) # Proceed without state
             
             processed_input = self.process_input(raw_input)
-            if not processed_input and raw_input not in [None, ""]:
+            if not processed_input and raw_input not in [None, ""]: # Allow empty string if raw_input was explicitly empty
                  return TaskResult(status="error", message="Input processing failed.", error_details={"original_input": str(raw_input)[:200]})
 
+            # --- Proactive Context Management START ---
+            if self.agent_config.proactive_enabled:
+                self.logger.info("Proactive context management ENABLED.")
+                # 1. Detect latent intent
+                # For now, env_signals is None. This can be expanded later.
+                latent_intent = await self._detect_latent_intent(raw_input, env_signals=None)
+                self.logger.info(f"Proactive: Latent intent detected: '{latent_intent}'")
+
+                if latent_intent and latent_intent != "latent_intent_placeholder": # Only proceed if a specific latent intent is found
+                    # 2. Proactively check memory
+                    retrieved_proactive_memory = await self._proactively_check_memory(latent_intent)
+
+                    if retrieved_proactive_memory:
+                        self.logger.info(f"Proactive: Memory found for latent intent '{latent_intent}'.")
+                        # 4. Inject proactive context
+                        injected_context = await self._inject_proactive_context(retrieved_proactive_memory)
+                        if injected_context:
+                            self.logger.info(f"Proactive: Context injected: {injected_context}")
+                            current_context = {**current_context, **injected_context} # Proactive context can be overridden by explicit user context
+                    else:
+                        self.logger.info(f"Proactive: No memory found for latent intent '{latent_intent}'.")
+                        # 3. Trigger listener for memory creation (if warranted)
+                        # For now, we'll assume it's warranted if latent_intent was detected and no memory found.
+                        # A more sophisticated check might be needed here in the future.
+                        creation_result = await self._trigger_listener_for_memory_creation(latent_intent, raw_input)
+                        if creation_result:
+                            self.logger.info(f"Proactive: Listener triggered for memory creation, result: {creation_result}")
+                        else:
+                            self.logger.warning(f"Proactive: Listener for memory creation did not complete or was not triggered for latent_intent '{latent_intent}'.")
+                else:
+                    self.logger.info("Proactive: No specific latent intent detected or placeholder returned, skipping proactive memory check/creation.")
+            else:
+                self.logger.info("Proactive context management DISABLED.")
+            # --- Proactive Context Management END ---
+
+            # Proceed with explicit intent detection and task dispatching
             intent_res = await self.detect_intent(processed_input)
-            route_decision = self.decide_route(intent_res)
+            # Enrich intent_res or context for route decision if needed from proactive steps
+            # For now, current_context has been updated if proactive context was injected.
+            # The routing logic itself might need to be aware of 'proactive_context' in current_context.
+
+            route_decision = self.decide_route(intent_res) # current_context is not explicitly passed here, but could be if routing needs it
             task_result = await self.dispatch_task(route_decision)
 
             if self.state_manager and conversation_id:
                 try:
-                    state_to_save = {"last_user_input": processed_input, "last_intent": intent_res.intent, "last_entities": intent_res.entities, "last_task_module": route_decision.target_module, "last_task_status": task_result.status, "timestamp": datetime.datetime.utcnow().isoformat()}
+                    state_to_save = {
+                        "last_user_input": processed_input,
+                        "last_intent": intent_res.intent,
+                        "last_entities": intent_res.entities,
+                        "last_task_module": route_decision.target_module,
+                        "last_task_status": task_result.status,
+                        # "proactive_context_retrieved": "proactive_context" in current_context, # Example of state to save
+                        "timestamp": datetime.datetime.utcnow().isoformat()
+                    }
+                    # Add proactive info to state if available
+                    if "proactive_context" in current_context:
+                        state_to_save["proactive_info"] = str(current_context["proactive_context"])[:200] # Storing a snippet
+
                     await self.state_manager.save_state(conversation_id, state_to_save)
                 except MemoryAccessError as e: self.logger.error(f"State saving failed for {conversation_id}: {e}", exc_info=True) # Non-critical for current result
             
-            self.logger.info(f"Request handled. Final status: {task_result.status}")
+            self.logger.info(f"Request handled. Final status: {task_result.status}. Context for next turn (sample): {{'proactive_context_exists': 'proactive_context' in current_context}}")
             return task_result
         
         except (IntentDetectionError, ConfigurationError, ExternalServiceError, CoreLogicError, MemoryAccessError) as e:
