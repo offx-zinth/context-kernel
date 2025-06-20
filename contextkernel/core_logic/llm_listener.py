@@ -2,10 +2,9 @@ import logging
 import asyncio
 import datetime
 import re
-import json # Added for JSONDecodeError
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field, ValidationError # Added ValidationError
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict # Ensure SettingsConfigDict is imported
 
 try:
@@ -20,7 +19,6 @@ from .exceptions import (
     ConfigurationError, ExternalServiceError, EmbeddingError, 
     MemoryAccessError, SummarizationError, PipelineError, CoreLogicError
 )
-from ..interfaces.protocols import BaseMemorySystem, RawCacheInterface, STMInterface, LTMInterface, GraphDBInterface
 
 logger = logging.getLogger(__name__)
 
@@ -36,21 +34,39 @@ class LLMListenerConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix='LLM_LISTENER_')
 
 
-# Interface definitions moved to contextkernel.interfaces.protocols
-# Stub class definitions (StubRawCache, StubSTM) moved to contextkernel.tests.mocks.memory_stubs.py
+class BaseMemorySystem:
+    def __init__(self):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger.info(f"{self.__class__.__name__} initialized.")
+
+class RawCacheInterface(BaseMemorySystem):
+    async def store(self, doc_id: str, data: Any) -> Optional[str]: raise NotImplementedError
+    async def load(self, doc_id: str) -> Optional[Any]: raise NotImplementedError
+
+class STMInterface(BaseMemorySystem):
+    async def save_summary(self, summary_id: str, summary_obj: Any, metadata: Optional[Dict[str, Any]]=None) -> None: raise NotImplementedError
+    async def load_summary(self, summary_id: str) -> Optional[Any]: raise NotImplementedError
+
+class LTMInterface(BaseMemorySystem):
+    async def save_document(self, doc_id: str, text_content: str, embedding: List[float], metadata: Optional[Dict[str, Any]]=None) -> None: raise NotImplementedError
+
+class GraphDBInterface(BaseMemorySystem):
+    async def add_entities(self, entities: List[Any], document_id: Optional[str]=None, metadata: Optional[Dict[str, Any]]=None) -> None: raise NotImplementedError
+    async def add_relations(self, relations: List[Any], document_id: Optional[str]=None, metadata: Optional[Dict[str, Any]]=None) -> None: raise NotImplementedError
+
+class StubRawCache(RawCacheInterface):
+    def __init__(self): super().__init__(); self.cache: Dict[str, Any] = {}
+    async def store(self, doc_id: str, data: Any) -> Optional[str]: self.cache[doc_id] = data; return doc_id
+    async def load(self, doc_id: str) -> Optional[Any]: return self.cache.get(doc_id)
+
+class StubSTM(STMInterface):
+    def __init__(self): super().__init__(); self.cache: Dict[str, Any] = {}
+    async def save_summary(self, summary_id: str, summary_obj: Any, metadata: Optional[Dict[str, Any]]=None) -> None: self.cache[summary_id] = {"summary": summary_obj, "metadata": metadata or {}}
+    async def load_summary(self, summary_id: str) -> Optional[Any]: return self.cache.get(summary_id)
 
 class TimestampedModel(BaseModel):
     created_at: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
     updated_at: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
-
-class LLMRelation(BaseModel):
-    subject: str
-    verb: str # or predicate
-    object: str
-    context: Optional[str] = None # Optional context
-
-class LLMRelationListOutput(BaseModel):
-    relations: List[LLMRelation]
 
 class Entity(TimestampedModel): text: str; type: str; metadata: Optional[Dict[str, Any]] = None
 class Relation(TimestampedModel): subject: str; verb: str; object: str; context: Optional[str] = None; metadata: Optional[Dict[str, Any]] = None
@@ -135,47 +151,18 @@ class LLMListener:
     async def _call_llm_extract_relations(self, text_content: str, entities: Optional[List[Dict[str, Any]]], instructions: Optional[Dict[str, Any]]=None) -> List[Dict[str, Any]]:
         found = []
         try:
-            if self.re_pipeline: # Dedicated RE pipeline
-                outputs = self.re_pipeline(text_content) # Assuming this pipeline returns a list of dicts
-                if isinstance(outputs, list):
-                    for item in outputs:
-                        if isinstance(item, dict) and all(k in item for k in ['subject', 'verb', 'object']): # Basic validation
-                            found.append({"subject": item["subject"], "verb": item.get("verb", item.get("predicate", item.get("relation"))), "object": item["object"], "context": item.get("context")})
-                        else:
-                            self.logger.warning(f"Skipping incompatible item from dedicated RE pipeline: {item}")
-            elif self.re_llm_pipeline: # General LLM for RE
+            if self.re_pipeline:
+                outputs = self.re_pipeline(text_content)
+                if isinstance(outputs, list): found.extend(r for r in outputs if isinstance(r, dict) and all(k in r for k in ['subject','relation','object']))
+            elif self.re_llm_pipeline:
                 if not self.re_llm_pipeline.tokenizer: raise ConfigurationError("RE LLM tokenizer missing.")
-
-                prompt = (
-                    f"Given the text, extract relations. Return the output as a JSON object with a single key 'relations', "
-                    f"which is a list of objects, where each object has 'subject', 'verb', and 'object' keys. Optionally include 'context'.\n"
-                    f"Text: \"{text_content}\"\n"
-                    f"Entities (for context, if helpful): {entities}\n"
-                    f"JSON Output:"
-                )
-
-                outputs = self.re_llm_pipeline(prompt, max_length=len(self.re_llm_pipeline.tokenizer.encode(prompt)) + 300) # Increased max_length for JSON
-
+                prompt = f"Entities: {entities}. Extract relations (Subj; Pred; Obj) from: \"{text_content}\""
+                outputs = self.re_llm_pipeline(prompt, max_length=len(self.re_llm_pipeline.tokenizer.encode(prompt)) + 150)
                 if outputs and outputs[0]['generated_text']:
-                    generated_json_str = outputs[0]['generated_text'][len(prompt):].strip()
-                    # Sometimes LLMs add backticks or "json" prefix
-                    generated_json_str = generated_json_str.removeprefix("```json").removesuffix("```").strip()
-
-                    try:
-                        parsed_output = LLMRelationListOutput.model_validate_json(generated_json_str)
-                        for rel_model in parsed_output.relations:
-                            found.append(rel_model.model_dump(exclude_none=True)) # Convert Pydantic model to dict
-                    except json.JSONDecodeError as e_json:
-                        self.logger.error(f"JSON decoding failed for RE LLM output: {e_json}. Output was: '{generated_json_str}'", exc_info=True)
-                        raise ExternalServiceError(f"RE LLM output was not valid JSON: {e_json}") from e_json
-                    except ValidationError as e_val:
-                        self.logger.error(f"Pydantic validation failed for RE LLM output: {e_val}. Output was: '{generated_json_str}'", exc_info=True)
-                        raise ExternalServiceError(f"RE LLM output did not match expected schema: {e_val}") from e_val
-        except ExternalServiceError: # Re-raise if it's already one of these
-            raise
-        except Exception as e: # Catch other unexpected errors during pipeline execution
-            self.logger.error(f"Unexpected RE pipeline/parsing error: {e}", exc_info=True)
-            raise ExternalServiceError(f"RE pipeline failed: {e}") from e
+                    for line in outputs[0]['generated_text'][len(prompt):].strip().split('\n'):
+                        match = re.match(r'\(\s*(.*?)\s*;\s*(.*?)\s*;\s*(.*?)\s*\)', line.strip())
+                        if match: found.append({"subject": match.group(1), "verb": match.group(2), "object": match.group(3)})
+        except Exception as e: raise ExternalServiceError(f"RE pipeline failed: {e}") from e
         return found
 
     async def _generate_insights(self, data: str, instructions: Optional[Dict[str, Any]], raw_id: Optional[str]) -> Dict[str, Any]:
