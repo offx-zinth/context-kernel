@@ -9,7 +9,7 @@ from typing import Optional
 from contextkernel.core_logic.summarizer import SummarizerConfig
 from contextkernel.core_logic.llm_retriever import LLMRetrieverConfig
 from contextkernel.core_logic.llm_listener import LLMListenerConfig
-from contextkernel.core_logic.context_agent import ContextAgentConfig
+from contextkernel.core_logic import NLPConfig # Updated import
 from contextkernel.core_logic.exceptions import ConfigurationError
 
 
@@ -77,7 +77,7 @@ class AppSettings(BaseSettings):
     summarizer: SummarizerConfig = Field(default_factory=SummarizerConfig)
     retriever: LLMRetrieverConfig = Field(default_factory=LLMRetrieverConfig)
     listener: LLMListenerConfig = Field(default_factory=LLMListenerConfig)
-    agent: ContextAgentConfig = Field(default_factory=ContextAgentConfig)
+    nlp: NLPConfig = Field(default_factory=NLPConfig) # Renamed from agent to nlp
 
     # Data stores
     redis: RedisConfig = Field(default_factory=RedisConfig)
@@ -120,7 +120,7 @@ if __name__ == "__main__":
         f.write("CK_LLM__API_KEY=mysecretllmapikey\n") # Example LLM API Key
         f.write("CK_SUMMARIZER__HF_ABSTRACTIVE_MODEL_NAME=google/pegasus-xsum-test\n")
         f.write("CK_RETRIEVER__DEFAULT_TOP_K=8\n")
-        f.write("CK_AGENT__INTENT_CLASSIFIER_MODEL=another/test-model\n")
+        f.write("CK_NLP__INTENT_CLASSIFIER_MODEL=another/test-model\n") # Updated from CK_AGENT_ to CK_NLP_
         f.write("CK_REDIS__HOST=testhost\n")
         f.write("CK_REDIS__PASSWORD=testredispassword\n")
         f.write("CK_NEO4J__USER=testuser\n")
@@ -146,7 +146,7 @@ if __name__ == "__main__":
             print(f"LLM API Key: {app_settings.llm.api_key.get_secret_value()[:5]}...") # Print only a part for security
         print(f"Summarizer Model: {app_settings.summarizer.hf_abstractive_model_name}")
         print(f"Retriever Top K: {app_settings.retriever.default_top_k}")
-        print(f"Agent Intent Model: {app_settings.agent.intent_classifier_model}")
+        print(f"NLP Intent Model: {app_settings.nlp.intent_classifier_model}") # Updated from agent to nlp
         print(f"Redis Host: {app_settings.redis.host}")
         if app_settings.redis.password:
             print(f"Redis Password: {app_settings.redis.password.get_secret_value()[:5]}...")

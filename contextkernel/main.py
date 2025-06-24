@@ -19,7 +19,7 @@ from contextkernel.utils.state_manager import (
 # from contextkernel.core_logic.summarizer import Summarizer       # Actual import
 
 # Import module configurations (already in config.py but good for explicitness here if needed)
-from contextkernel.core_logic.context_agent import ContextAgentConfig
+from contextkernel.core_logic import NLPConfig # Updated import
 from contextkernel.core_logic.llm_listener import LLMListenerConfig
 from contextkernel.core_logic.llm_retriever import LLMRetrieverConfig
 from contextkernel.core_logic.summarizer import SummarizerConfig
@@ -56,7 +56,7 @@ class LLMListener:
 
 class ContextAgent:
     def __init__(self,
-                 config: ContextAgentConfig,
+                 nlp_config: NLPConfig, # Updated from config: ContextAgentConfig
                  stm: AbstractStateManager,
                  ltm: AbstractStateManager, # Placeholder for dedicated LTM
                  graph_db: Any, # Placeholder for Graph DB interface
@@ -211,7 +211,7 @@ def main():
     # ContextAgent is initialized with its dependencies. This pattern is key for testability,
     # as each dependency (STM, LTM, LLM, services) can be replaced with a mock during testing.
     context_agent = ContextAgent(
-        config=config.agent,
+        nlp_config=config.nlp, # Updated from config.agent
         stm=state_manager_instance, # Using the chosen state manager for STM
         ltm=ltm_placeholder,       # Placeholder LTM
         graph_db=graph_db_placeholder, # Placeholder GraphDB
