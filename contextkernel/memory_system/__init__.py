@@ -9,6 +9,7 @@ from .ltm import LTM
 from .graph_db import GraphDB
 from .raw_cache import RawCache
 from .graph_indexer import GraphIndexer
+from ....memory_manager import MemoryManager # Adjusted import path
 
 # Import client libraries
 from redis.asyncio import Redis as RedisClient
@@ -32,6 +33,7 @@ class MemoryKernel:
     # Declare client attributes for type hinting and clarity
     redis_client: RedisClient
     neo4j_driver: AsyncDriver
+    memory_manager: MemoryManager # Added type hint
     # Generic clients for services; specific instances depend on AppSettings
     shared_nlp_client: NLPClientType
     shared_embedding_client: EmbeddingModelClientType
@@ -124,6 +126,15 @@ class MemoryKernel:
             intent_tagger_config=app_settings.nlp_service_config,
             intent_tagger_client=self.shared_nlp_client # Placeholder
         )
+
+        # Instantiate MemoryManager
+        self.memory_manager = MemoryManager(
+            graph_db=self.graph_db,
+            ltm=self.ltm,
+            stm=self.stm,
+            raw_cache=self.raw_cache
+        )
+        logger.info("MemoryManager instantiated.")
 
         logger.info("MemoryKernel components initialized with configurations from AppSettings.")
         MemoryKernel._instance = self # Set the instance after successful initialization
@@ -276,174 +287,12 @@ class MemoryKernel:
         MemoryKernel._clients_initialized = False # Reset flag
         logger.info("MemoryKernel shutdown complete.")
 
-    async def get_context(self, query: str, session_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Retrieves context relevant to the query from LTM, STM, and GraphDB.
-        """
-        logger.info(f"Received get_context request for query: '{query}', session_id: {session_id}")
-        synthesis_log = []
-        context_results: Dict[str, Any] = {
-            "query": query,
-            "retrieved_ltm_items": [],
-            "recent_stm_turns": [],
-            "related_graph_entities": [],
-            "synthesis_log": synthesis_log,
-        }
-
-        # 1. Query Embedding
-        query_embedding: Optional[List[float]] = None
-        try:
-            query_embedding = await self.ltm.generate_embedding(query)
-            synthesis_log.append(f"Query embedding generated successfully (dim: {len(query_embedding)}).")
-        except Exception as e:
-            logger.error(f"Error generating query embedding: {e}", exc_info=True)
-            synthesis_log.append(f"Error generating query embedding: {e}")
-            # Depending on policy, might return early or continue without LTM/some GraphDB features
-            # For now, continue if possible.
-
-        # 2. LTM Retrieval
-        if query_embedding:
-            try:
-                ltm_items = await self.ltm.retrieve_relevant_memories(query_embedding=query_embedding, top_k=5)
-                context_results["retrieved_ltm_items"] = ltm_items
-                synthesis_log.append(f"Retrieved {len(ltm_items)} items from LTM.")
-            except Exception as e:
-                logger.error(f"Error retrieving from LTM: {e}", exc_info=True)
-                synthesis_log.append(f"Error retrieving from LTM: {e}")
-        else:
-            synthesis_log.append("Skipping LTM retrieval due to missing query embedding.")
-
-        # 3. STM Retrieval
-        if session_id:
-            try:
-                stm_turns = await self.stm.get_recent_turns(session_id=session_id, num_turns=10)
-                context_results["recent_stm_turns"] = stm_turns
-                synthesis_log.append(f"Retrieved {len(stm_turns)} turns from STM for session '{session_id}'.")
-            except Exception as e:
-                logger.error(f"Error retrieving from STM for session '{session_id}': {e}", exc_info=True)
-                synthesis_log.append(f"Error retrieving from STM: {e}")
-        else:
-            synthesis_log.append("No session_id provided, skipping STM retrieval.")
-
-        # 4. GraphDB Retrieval (Simplified Entity Linking & Expansion)
-        try:
-            if self.graph_indexer.nlp_processor: # Check if spaCy model is loaded
-                loop = asyncio.get_running_loop()
-                doc = await loop.run_in_executor(None, self.graph_indexer.nlp_processor, query)
-                extracted_entities = [{"text": ent.text, "label": ent.label_} for ent in doc.ents]
-                synthesis_log.append(f"Extracted entities from query: {extracted_entities}")
-
-                graph_entities_data = []
-                for entity in extracted_entities:
-                    # Note: This simple query matches on node_id, but GraphIndexer creates entity nodes with `name`.
-                    # Adjusting query to match on `name` property.
-                    # Also, GraphDB stores entity type in `entity_type` property.
-                    # A more robust approach would involve specific GraphDB methods for entity linking.
-                    entity_query = (
-                        "MATCH (e {name: $entity_name}) "
-                        "OPTIONAL MATCH (e)-[r]-(related) "
-                        "RETURN e, collect({relationship: type(r), target_node: properties(related)}) AS relations LIMIT 5"
-                    )
-                    # entity_query = "MATCH (e {name: $entity_name}) RETURN e LIMIT 1" # Simpler query
-                    entity_graph_data = await self.graph_db.cypher_query(entity_query, {"entity_name": entity["text"]})
-                    if entity_graph_data:
-                        graph_entities_data.extend(entity_graph_data)
-                context_results["related_graph_entities"] = graph_entities_data
-                synthesis_log.append(f"Retrieved {len(graph_entities_data)} related items/entities from GraphDB based on query entities.")
-            else:
-                synthesis_log.append("GraphIndexer NLP processor not available, skipping GraphDB entity linking.")
-        except Exception as e:
-            logger.error(f"Error during GraphDB retrieval: {e}", exc_info=True)
-            synthesis_log.append(f"Error during GraphDB retrieval: {e}")
-
-        logger.info(f"Context retrieval complete for query '{query}'. Log: {synthesis_log}")
-        return context_results
-
-    async def store_context(self, data: Dict[str, Any], session_id: Optional[str] = None) -> bool:
-        """
-        Stores data into the appropriate memory components based on its structure.
-        - "text_content" & "metadata": Processed by GraphIndexer, then stored in LTM.
-        - "ephemeral_data": Stored in RawCache.
-        - "turn_data": Added to STM if session_id is provided.
-        """
-        logger.info(f"Received store_context request. Session_id: {session_id}. Data keys: {list(data.keys())}")
-        overall_success = True
-
-        # 1. Ephemeral Data to RawCache
-        ephemeral_content = data.get("ephemeral_data")
-        if ephemeral_content:
-            try:
-                ephemeral_key = f"ephemeral_{data.get('chunk_id', str(uuid.uuid4()))}"
-                await self.raw_cache.set(key=ephemeral_key, value=ephemeral_content, ttl_seconds=3600)
-                logger.info(f"Stored ephemeral data to RawCache with key: {ephemeral_key}")
-            except Exception as e:
-                logger.error(f"Error storing ephemeral data to RawCache: {e}", exc_info=True)
-                overall_success = False
-
-        # 2. Conversational Turn to STM
-        turn_content = data.get("turn_data")
-        if session_id and turn_content:
-            if isinstance(turn_content, dict):
-                try:
-                    await self.stm.add_turn(session_id=session_id, turn_data=turn_content)
-                    logger.info(f"Added turn data to STM for session '{session_id}'.")
-                except Exception as e:
-                    logger.error(f"Error adding turn data to STM for session '{session_id}': {e}", exc_info=True)
-                    overall_success = False
-            else:
-                logger.warning(f"Skipping STM storage: 'turn_data' is not a dictionary (type: {type(turn_content)}).")
-                overall_success = False # Or handle as a non-critical warning
-
-        # 3. Primary Content to GraphIndexer, GraphDB, and LTM
-        text_content = data.get("text_content")
-        if text_content: # Only proceed if there's primary text content
-            chunk_id = data.get("chunk_id", str(uuid.uuid4()))
-            metadata = data.get("metadata", {})
-
-            # 3a. Process with GraphIndexer (stores in GraphDB)
-            try:
-                # GraphIndexer expects chunk_data to be a dict or str.
-                # If it's just text_content and metadata, we can pass it as a dict.
-                indexer_input_data = {"text_content": text_content, **metadata}
-                processing_result = await self.graph_indexer.process_memory_chunk(
-                    chunk_id=chunk_id,
-                    chunk_data=indexer_input_data
-                )
-                logger.info(f"GraphIndexer processing result for chunk '{chunk_id}': {processing_result.get('status', 'unknown')}")
-                if processing_result.get('status') != 'success':
-                    overall_success = False
-            except Exception as e:
-                logger.error(f"Error processing chunk '{chunk_id}' with GraphIndexer: {e}", exc_info=True)
-                overall_success = False
-
-            # 3b. Store in LTM
-            # Generate embedding (LTM's generate_embedding uses caching)
-            # Then store the original text_content, this new embedding, and original metadata in LTM.
-            try:
-                ltm_embedding = await self.ltm.generate_embedding(text_content)
-                if ltm_embedding: # Ensure embedding was generated
-                    ltm_store_id = await self.ltm.store_memory_chunk(
-                        chunk_id=chunk_id, # Use the same chunk_id for consistency if desired
-                        text_content=text_content,
-                        embedding=ltm_embedding,
-                        metadata=metadata
-                    )
-                    logger.info(f"Stored text content for chunk '{chunk_id}' in LTM with ID '{ltm_store_id}'.")
-                else:
-                    logger.error(f"Failed to generate embedding for LTM storage of chunk '{chunk_id}'.")
-                    overall_success = False
-            except Exception as e:
-                logger.error(f"Error storing chunk '{chunk_id}' content to LTM: {e}", exc_info=True)
-                overall_success = False
-        elif "ephemeral_data" not in data and "turn_data" not in data:
-            # If no text_content, and no other specific data types handled, it's a bit of an empty call.
-            logger.warning("store_context called with no 'text_content', 'ephemeral_data', or 'turn_data'. No primary storage action taken.")
-            # overall_success could be set to False here if this is considered an invalid call.
-
-        return overall_success
-
 async def main():
     # Example Usage for MemoryKernel
+    # Note: The get_context and store_context methods have been removed from MemoryKernel.
+    # Their logic will be handled by IngestionProcessor and RetrievalProcessor,
+    # and MemoryManager will handle the storage details.
+    # This main function needs to be updated to reflect those changes.
     logger.info("--- MemoryKernel Example Usage ---")
 
     # 1. Create AppSettings (loads from environment or defaults)
@@ -485,55 +334,23 @@ async def main():
         await kernel.boot()
         logger.info("MemoryKernel boot complete.")
 
-        # 4. Example: Store some context items
-        logger.info("--- Storing Context Examples ---")
-        session_id_example = f"session_{str(uuid.uuid4())}"
+        # The following sections demonstrating store_context and get_context are now obsolete
+        # as these methods have been removed from MemoryKernel.
+        # New examples would involve IngestionProcessor and RetrievalProcessor.
+        logger.info("--- MemoryKernel main example: store_context and get_context are removed ---")
+        logger.info("--- Business logic now resides in IngestionProcessor and RetrievalProcessor ---")
+        logger.info("--- MemoryManager handles direct storage operations ---")
 
-        # Item 1: General text content
-        await kernel.store_context({
-            "chunk_id": "doc1_chunk1",
-            "text_content": "The first document is about artificial intelligence and its impact on society. AI is rapidly evolving.",
-            "metadata": {"source": "doc1", "type": "general_info", "tags": ["AI", "society"]}
-        }, session_id=session_id_example)
+        # Example: Accessing the memory_manager (if needed for direct operations, though typically not)
+        if hasattr(kernel, 'memory_manager'):
+            logger.info(f"MemoryManager is available: {kernel.memory_manager}")
+        else:
+            logger.warning("MemoryManager not found on kernel instance.")
 
-        # Item 2: Conversational turn for STM and also as general text content
-        turn_data_user = {"role": "user", "content": "What are the benefits of AI in healthcare?"}
-        await kernel.store_context({
-            "chunk_id": "chat1_turn1",
-            "text_content": turn_data_user["content"], # Indexing the content part
-            "metadata": {"source": "chat1", "user": "user_A", "tags": ["AI", "healthcare", "question"]},
-            "turn_data": turn_data_user # For STM
-        }, session_id=session_id_example)
-
-        turn_data_assistant = {"role": "assistant", "content": "AI can improve diagnostics, personalize treatments, and accelerate research in healthcare."}
-        await kernel.store_context({
-            "chunk_id": "chat1_turn2",
-            "text_content": turn_data_assistant["content"], # Indexing the content part
-            "metadata": {"source": "chat1", "user": "assistant_B", "tags": ["AI", "healthcare", "answer"]},
-            "turn_data": turn_data_assistant # For STM
-        }, session_id=session_id_example)
-
-        # Item 3: Ephemeral data
-        await kernel.store_context({
-            "chunk_id": "ephem1", # Optional, helps key generation
-            "ephemeral_data": {"user_preference": "dark_mode", "timestamp": asyncio.get_running_loop().time()}
-        })
 
         # Allow some time for async operations if any are truly backgrounded (not an issue with current structure)
         await asyncio.sleep(0.1)
 
-        # 5. Example: Get context
-        logger.info("--- Getting Context Example ---")
-        query1 = "AI in society"
-        retrieved_context1 = await kernel.get_context(query=query1, session_id=session_id_example)
-        logger.info(f"Context for query '{query1}':\n{json.dumps(retrieved_context1, indent=2, default=str)}")
-        assert len(retrieved_context1["retrieved_ltm_items"]) > 0, f"Expected LTM items for query: {query1}"
-
-        query2 = "AI in healthcare"
-        retrieved_context2 = await kernel.get_context(query=query2, session_id=session_id_example)
-        logger.info(f"Context for query '{query2}' (with session_id '{session_id_example}'):\n{json.dumps(retrieved_context2, indent=2, default=str)}")
-        assert len(retrieved_context2["recent_stm_turns"]) == 2, "Expected STM turns from current session"
-        assert len(retrieved_context2["retrieved_ltm_items"]) > 0, f"Expected LTM items for query: {query2}"
 
     except Exception as e:
         logger.error(f"An error occurred during MemoryKernel main example: {e}", exc_info=True)
