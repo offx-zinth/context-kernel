@@ -6,6 +6,7 @@ import re
 from typing import Optional, List, Dict, Any, Union
 
 from pydantic_settings import BaseSettings, SettingsConfigDict # For Config model
+from core_logic.chunker import SemanticChunker # Added for new chunker
 
 try:
     from transformers import AutoTokenizer, pipeline, PreTrainedTokenizerFast, PreTrainedTokenizer
