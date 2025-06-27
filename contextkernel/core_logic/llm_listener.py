@@ -351,3 +351,56 @@ class LLMListener:
         except Exception as e:
             self.logger.error(f"Unexpected error in process_data: {e}", exc_info=True)
             raise CoreLogicError(f"Unexpected error in data processing: {e}") from e
+
+    async def generate_structured_insight(self, data_str: str, context_instructions: Optional[Dict[str, Any]]=None, raw_id_if_pre_cached: Optional[str]=None) -> Optional[StructuredInsight]:
+        """
+        Generates and structures insights from data string without writing to memory.
+        This method encapsulates _generate_insights and _structure_data.
+        Args:
+            data_str: The string data to process.
+            context_instructions: Instructions for summarization, entity/relation extraction.
+            raw_id_if_pre_cached: Optional ID if the raw data was already cached.
+        Returns:
+            A StructuredInsight object or None if generation/structuring fails.
+        """
+        self.logger.debug(f"Generating structured insight for data: {data_str[:100]}...")
+        if not data_str.strip():
+            self.logger.warning("Empty data string provided to generate_structured_insight.")
+            return None
+
+        try:
+            # Note: _generate_insights might still interact with raw_cache if it's part of its logic
+            # and if raw_id_if_pre_cached is None.
+            # The original _generate_insights in LLMListener does not store to raw_cache,
+            # process_data calls raw_cache.store separately *before* _generate_insights.
+            # So, this new method should not implicitly store to raw_cache.
+            # raw_id_if_pre_cached is purely for informational purposes if the caller pre-cached.
+
+            insights_dict = await self._generate_insights(
+                data=data_str,
+                instructions=context_instructions or {},
+                raw_id=raw_id_if_pre_cached # Pass along if provided
+            )
+
+            if not insights_dict:
+                self.logger.warning("Insight generation failed (insights_dict is None).")
+                return None
+
+            # Ensure 'original_data' is in insights_dict for _structure_data if it expects it.
+            # _generate_insights already puts 'original_data': data_str into the dict.
+            # insights_dict["original_data"] = data_str # This should be redundant if _generate_insights does it
+
+            structured_data = await self._structure_data(insights_dict)
+            if not structured_data:
+                self.logger.warning("Data structuring failed (structured_data is None).")
+                return None
+
+            self.logger.debug("Successfully generated and structured insight.")
+            return structured_data
+        except Exception as e:
+            self.logger.error(f"Error in generate_structured_insight: {e}", exc_info=True)
+            # Depending on desired behavior, could re-raise or return None
+            # Raising CoreLogicError if it's a known category from internal calls.
+            if isinstance(e, (ConfigurationError, SummarizationError, EmbeddingError, ExternalServiceError, PipelineError, CoreLogicError)):
+                raise
+            raise CoreLogicError(f"Unexpected error in insight generation/structuring: {e}") from e
