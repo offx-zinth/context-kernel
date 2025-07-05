@@ -475,6 +475,113 @@ class STM:
         logger.info(f"Prefetch requested for session '{session_id}' (stubbed - no specific action for Redis-backed STM currently).")
         await asyncio.sleep(0.01) # Simulate async operation
 
+    def _get_redis_summary_key(self, summary_id: str) -> str:
+        """Helper to generate a consistent Redis key for a stored summary."""
+        return f"stm_summary:{summary_id}"
+
+    async def save_summary(self, summary_id: str, summary_obj: Any, metadata: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Saves a summary object with its metadata to Redis.
+        The summary_obj can be a string or a Pydantic model (like llm_listener.Summary).
+        It will be stored as a JSON object: {"summary_content": ..., "metadata": ...}.
+        """
+        if not self.redis_client:
+            logger.error("Redis client not available. Cannot save summary.")
+            raise MemoryAccessError("Redis client not available for STM save_summary.")
+
+        if not summary_id:
+            logger.error("summary_id must be provided to save a summary.")
+            raise ValueError("summary_id is required for save_summary.")
+
+        summary_key = self._get_redis_summary_key(summary_id)
+
+        # Prepare the data to store. If summary_obj is a Pydantic model, convert to dict.
+        content_to_store = summary_obj
+        if hasattr(summary_obj, 'model_dump'): # Check if it's a Pydantic model
+            content_to_store = summary_obj.model_dump()
+        elif not isinstance(summary_obj, (str, dict, list, int, float, bool, type(None))):
+            # If it's some other complex object not directly JSON serializable, convert to string.
+            logger.warning(f"summary_obj for {summary_id} is of type {type(summary_obj)}, will be stored as str().")
+            content_to_store = str(summary_obj)
+
+        data_to_store = {
+            "summary_content": content_to_store,
+            "metadata": metadata or {}
+        }
+        serialized_data = json.dumps(data_to_store)
+
+        try:
+            await self.redis_client.set(summary_key, serialized_data) # No TTL by default for summaries, or use a long one
+            logger.info(f"Saved summary '{summary_id}' to Redis. Key: '{summary_key}'. Preview: {str(content_to_store)[:100]}...")
+        except Exception as e:
+            logger.error(f"Error saving summary '{summary_id}' to Redis: {e}", exc_info=True)
+            raise MemoryAccessError(f"Failed to save summary {summary_id} to Redis.") from e
+
+    async def update_summary(self, summary_id: str, updates: Dict[str, Any]) -> None:
+        """
+        Updates an existing summary in Redis.
+        'updates' can contain 'summary_content' and/or 'metadata' keys.
+        If 'metadata' is in updates, it merges with existing metadata.
+        """
+        if not self.redis_client:
+            logger.error("Redis client not available. Cannot update summary.")
+            raise MemoryAccessError("Redis client not available for STM update_summary.")
+
+        summary_key = self._get_redis_summary_key(summary_id)
+        try:
+            existing_data_serialized = await self.redis_client.get(summary_key)
+            if not existing_data_serialized:
+                logger.error(f"Summary '{summary_id}' not found for update. Key: {summary_key}")
+                raise MemoryAccessError(f"Summary {summary_id} not found for update.")
+
+            existing_data = json.loads(existing_data_serialized.decode('utf-8'))
+
+            if "summary_content" in updates:
+                new_content = updates["summary_content"]
+                if hasattr(new_content, 'model_dump'):
+                    existing_data["summary_content"] = new_content.model_dump()
+                else:
+                    existing_data["summary_content"] = new_content
+
+            if "metadata" in updates:
+                if not isinstance(existing_data.get("metadata"), dict):
+                    existing_data["metadata"] = {} # Ensure metadata key exists as dict
+                if isinstance(updates["metadata"], dict):
+                    existing_data["metadata"].update(updates["metadata"])
+                else:
+                    logger.warning(f"Metadata update for {summary_id} is not a dict. Ignoring metadata update part.")
+
+            new_serialized_data = json.dumps(existing_data)
+            await self.redis_client.set(summary_key, new_serialized_data)
+            logger.info(f"Updated summary '{summary_id}' in Redis. Updates applied: {list(updates.keys())}")
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding existing summary data for '{summary_id}': {e}", exc_info=True)
+            raise MemoryAccessError(f"Corrupted summary data for {summary_id}.") from e
+        except Exception as e:
+            logger.error(f"Error updating summary '{summary_id}' in Redis: {e}", exc_info=True)
+            raise MemoryAccessError(f"Failed to update summary {summary_id}.") from e
+
+    async def delete_summary(self, summary_id: str) -> None:
+        """Deletes a summary from Redis by its summary_id."""
+        if not self.redis_client:
+            logger.error("Redis client not available. Cannot delete summary.")
+            # Depending on strictness, could raise MemoryAccessError or just log and return.
+            # For consistency with MemoryManager.forget, let's assume it should try its best.
+            return
+
+        summary_key = self._get_redis_summary_key(summary_id)
+        try:
+            result = await self.redis_client.delete(summary_key)
+            if result > 0:
+                logger.info(f"Deleted summary '{summary_id}' (key: {summary_key}) from Redis.")
+            else:
+                logger.info(f"Attempted to delete non-existent summary '{summary_id}' (key: {summary_key}).")
+        except Exception as e:
+            logger.error(f"Error deleting summary '{summary_id}' from Redis: {e}", exc_info=True)
+            # Potentially raise MemoryAccessError if deletion failure is critical.
+            # For `forget`, best effort might mean just logging the error.
+
 
 async def main():
     """Example usage of the STM system, demonstrating Redis integration."""

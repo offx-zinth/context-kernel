@@ -1,27 +1,189 @@
 import re
-from typing import List, Callable
+from typing import List, Callable, Dict, Any, Optional
+import logging
+import spacy # For NLP tasks
+from spacy.matcher import Matcher # For rule-based intent matching
 
-# Placeholder for a more sophisticated tokenizer if needed (e.g., from Hugging Face)
-# For now, we'll use a simple whitespace and punctuation-based split for tokens.
+# Assuming NLPConfig might be defined elsewhere or parts of it passed directly.
+# from .nlp_utils import NLPConfig # Or a new shared config location
+
+# Placeholder for Transformers pipeline if used directly by chunker for advanced labeling
+try:
+    from transformers import Pipeline as TransformersPipeline
+except ImportError:
+    TransformersPipeline = None # type: ignore
+
+logger = logging.getLogger(__name__)
+
+# Default tokenizer if none provided
 def default_tokenizer(text: str) -> List[str]:
     """Splits text into tokens based on whitespace and basic punctuation."""
-    # Remove punctuation and then split by space
-    # text_no_punct = re.sub(r'[^\w\s]', '', text)
-    # tokens = text_no_punct.lower().split()
-    # More robust tokenization might be needed for true "semantic" chunking later
-    tokens = re.findall(r'\b\w+\b|[.,;!?()]', text) # Keeps punctuation as separate tokens
+    tokens = re.findall(r'\b\w+\b|[.,;!?()]', text)
     return tokens
 
 class SemanticChunker:
-    def __init__(self, tokenizer: Callable[[str], List[str]] = None):
+    def __init__(self,
+                 tokenizer: Optional[Callable[[str], List[str]]] = None,
+                 nlp_model: Optional[spacy.language.Language] = None, # Spacy model instance
+                 matcher: Optional[Matcher] = None, # Spacy Matcher instance
+                 intent_classifier: Optional[TransformersPipeline] = None, # HF pipeline for intent
+                 # config: Optional[NLPConfig] = None # Or pass relevant config values directly
+                 use_spacy_matcher_first: bool = True,
+                 intent_candidate_labels: List[str] = None,
+                 default_intent_confidence: float = 0.5,
+                 high_confidence_threshold: float = 0.8
+                ):
         """
         Initializes the SemanticChunker.
 
         Args:
             tokenizer: A function that takes a string and returns a list of tokens.
-                       If None, a default simple tokenizer will be used.
+            nlp_model: Initialized spaCy language model.
+            matcher: Initialized spaCy Matcher.
+            intent_classifier: Initialized Hugging Face zero-shot classification pipeline.
+            use_spacy_matcher_first: Whether to use spaCy Matcher before classifier for intent.
+            intent_candidate_labels: Candidate labels for the intent classifier.
+            default_intent_confidence: Default confidence for intents.
+            high_confidence_threshold: Confidence threshold to consider a spaCy match strong enough.
         """
         self.tokenizer = tokenizer if tokenizer else default_tokenizer
+        self.nlp = nlp_model
+        self.matcher = matcher
+        self.intent_classifier = intent_classifier
+
+        # Store config values needed for labeling
+        self.use_spacy_matcher_first = use_spacy_matcher_first
+        self.intent_candidate_labels = intent_candidate_labels or ["question", "command", "statement", "request_info"]
+        self.default_intent_confidence = default_intent_confidence
+        self.high_confidence_threshold = high_confidence_threshold
+
+        if not self.nlp:
+            logger.warning("SemanticChunker initialized without a spaCy NLP model. Labeling capabilities will be limited.")
+        # Matcher requires nlp.vocab, so if matcher is provided, nlp should also be.
+        if self.matcher and not self.nlp:
+            logger.error("Matcher provided to SemanticChunker without an NLP model. Matcher will not work.")
+            self.matcher = None # Disable matcher if NLP model is missing
+
+    async def label_chunk(self, chunk_text: str) -> Dict[str, Any]:
+        """
+        Applies semantic labels to a single text chunk.
+        Migrates logic from nlp_utils.py for intent detection and entity recognition.
+
+        Args:
+            chunk_text: The text chunk to label.
+
+        Returns:
+            A dictionary containing labels like intent, entities, keywords.
+            Example: {"intent": "question", "entities": {"Person": ["Alice"]}, "keywords": ["memory", "database"]}
+        """
+        if not self.nlp:
+            logger.warning("NLP model not available in Chunker. Cannot perform advanced labeling.")
+            return {"intent": "unknown", "entities": {}, "keywords": [], "confidence": 0.0}
+
+        processed_input = chunk_text.lower().strip() # Similar to nlp_utils.process_input
+        intent = "unknown"
+        entities: Dict[str, Any] = {}
+        confidence = self.default_intent_confidence
+        # spacy_doc is not returned in the final dict but used internally.
+        # matched_patterns from nlp_utils is also not directly returned but influences intent.
+
+        spacy_doc = self.nlp(processed_input) # Process with Spacy
+
+        # 1. Intent Detection (adapted from nlp_utils.detect_intent)
+        # 1a. Try spaCy Matcher first if configured and available
+        if self.use_spacy_matcher_first and self.matcher:
+            matches = self.matcher(spacy_doc)
+            if matches:
+                # Using the first match like in nlp_utils.
+                # More sophisticated logic could analyze all matches.
+                match_id, start, end = matches[0]
+                intent = self.nlp.vocab.strings[match_id]
+                confidence = self.high_confidence_threshold
+
+                # Basic entity extraction from match (simplified from nlp_utils)
+                # This part of nlp_utils `keyword_end_token_index` is complex;
+                # for now, we'll rely on general NER below or simplify.
+                # matched_text_for_entity = spacy_doc[start:end].text # This is the whole matched phrase
+                # For now, we'll let the general NER handle entities rather than rule-based from intent.
+
+        # 1b. If Matcher didn't yield high-confidence intent, try classifier
+        if intent == "unknown" or confidence < self.high_confidence_threshold:
+            if self.intent_classifier and self.intent_candidate_labels:
+                try:
+                    # Ensure classifier call is compatible (e.g., non-async if this method is sync)
+                    # If intent_classifier is an async pipeline, this method should be async
+                    # and the call awaited. For now, assuming it's a sync pipeline.
+                    # The plan specifies `async def label_chunk` so this should be awaited.
+                    if hasattr(self.intent_classifier, "__call__"): # Check if callable
+                        # Assuming the pipeline might be async if it's a TransformersPipeline
+                        # This part needs careful handling of sync/async based on actual pipeline type
+                        # For now, direct call, assuming it's okay or placeholder.
+                        # If it's a true TransformersPipeline, it's often not async directly.
+                        # It would need to be run in an executor if label_chunk is async.
+                        # Given `async def label_chunk`, we should use:
+                        # loop = asyncio.get_event_loop()
+                        # result = await loop.run_in_executor(None, self.intent_classifier, processed_input, self.intent_candidate_labels)
+                        # For now, let's make a simplifying assumption that the pipeline is somehow awaitable or this is conceptual.
+                        # This is a known point of complexity from the original nlp_utils.
+                        # Let's assume for now it's a synchronous call for simplicity of this step,
+                        # and it will be wrapped if needed by the caller or if intent_classifier is an async wrapper.
+
+                        # Per plan, label_chunk is async. So, classifier call must be awaitable or run in executor.
+                        # Placeholder for actual async execution:
+                        if callable(getattr(self.intent_classifier, "_async_call", None)): # Fictional async call
+                             result = await self.intent_classifier._async_call(processed_input, candidate_labels=self.intent_candidate_labels)
+                        elif callable(self.intent_classifier):
+                            # This is a simplification. A real HF pipeline might need `loop.run_in_executor`.
+                            # For this step, let's assume it's a mockable sync call for structure.
+                            logger.warning("Intent classifier called synchronously in async method. Consider executor for non-async pipelines.")
+                            result = self.intent_classifier(processed_input, candidate_labels=self.intent_candidate_labels, multi_label=False)
+                        else:
+                            raise TypeError("Intent classifier is not callable.")
+
+                        if result and result.get('labels') and result.get('scores'):
+                            intent = result['labels'][0]
+                            confidence = result['scores'][0]
+                        else:
+                            logger.warning(f"Intent classifier returned unexpected result for '{processed_input}': {result}")
+                            if intent == "unknown": # If matcher also failed
+                                intent = "statement" # Default fallback
+                                confidence = self.default_intent_confidence
+                    else:
+                        logger.error("Intent classifier is not callable.")
+                        if intent == "unknown": intent = "statement"; confidence = self.default_intent_confidence
+
+
+                except Exception as e_clf:
+                    logger.error(f"Intent classification error for chunk '{processed_input[:50]}...': {e_clf}", exc_info=True)
+                    if intent == "unknown": # Fallback if matcher also didn't set intent
+                        intent = "statement"
+                        confidence = self.default_intent_confidence
+            elif intent == "unknown": # No classifier, and matcher failed or not used
+                intent = "statement" # Default fallback intent
+                confidence = self.default_intent_confidence
+
+        # 2. Entity Recognition (using spaCy NER)
+        if spacy_doc.ents:
+            for ent in spacy_doc.ents:
+                label = ent.label_.lower()
+                entities.setdefault(label, []).append(ent.text)
+            # Consolidate list values like in nlp_utils
+            for k, v_list in entities.items():
+                if isinstance(v_list, list):
+                    entities[k] = list(set(v_list)) # Keep unique entities
+
+        # 3. Keyword Extraction (simple placeholder: significant nouns and verbs)
+        # This is a very basic keyword extraction. More advanced methods could be used.
+        keywords = [token.lemma_.lower() for token in spacy_doc if token.pos_ in ("NOUN", "PROPN", "VERB") and not token.is_stop]
+        keywords = list(set(keywords)) # Unique keywords
+
+        return {
+            "intent": intent,
+            "entities": entities,
+            "keywords": keywords[:10], # Limit number of keywords for brevity
+            "confidence": confidence,
+            "text_preview": chunk_text[:100] # Add a preview for context
+        }
 
     def _chunk_text_by_tokens(self, text: str, max_tokens: int) -> List[str]:
         """
