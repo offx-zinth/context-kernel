@@ -75,6 +75,20 @@ class VectorDB(abc.ABC):
         pass
 
     @abc.abstractmethod
+    async def update_embedding(self, memory_id: str, updates: Dict[str, Any]) -> None:
+        """
+        Updates an existing embedding and/or its metadata.
+        If 'embedding' is in updates, the vector is replaced.
+        Other keys in updates are treated as metadata updates.
+
+        Args:
+            memory_id: The unique identifier of the memory to update.
+            updates: A dictionary containing updates. Can include "embedding": List[float]
+                     and other keys for metadata.
+        """
+        pass
+
+    @abc.abstractmethod
     async def boot(self) -> bool:
         """
         Boots up the vector database. This can include loading an index from disk,
@@ -789,6 +803,76 @@ class FAISSVectorDB(VectorDB):
         # Example: Add specific FAISS index type if useful
         # status_dict["faiss_index_type"] = type(self.faiss_index).__name__ if self.faiss_index else "N/A"
         return status_dict
+
+    async def update_embedding(self, memory_id: str, updates: Dict[str, Any]) -> None:
+        """
+        Updates an embedding and/or its metadata in FAISSVectorDB.
+        - If 'embedding' in updates: the vector is replaced (remove old, add new).
+        - Other keys in updates: update the metadata for memory_id.
+        """
+        if not self.faiss_index or self.embedding_dimension is None:
+            logger.error("FAISSVectorDB not properly booted. Cannot update embedding.")
+            raise RuntimeError("FAISSVectorDB not properly booted.")
+
+        if memory_id not in self.memory_id_to_faiss_id:
+            logger.error(f"Memory ID '{memory_id}' not found. Cannot update.")
+            # Or, should this be an upsert? For now, strict update.
+            raise ValueError(f"Memory ID '{memory_id}' not found for update.")
+
+        new_embedding_vector = updates.pop("embedding", None) # Pop embedding if present
+
+        if new_embedding_vector:
+            if not isinstance(new_embedding_vector, list) or \
+               not all(isinstance(x, (float, int)) for x in new_embedding_vector):
+                logger.error(f"Invalid new embedding vector format for {memory_id}.")
+                raise ValueError("New embedding vector must be a list of numbers.")
+
+            new_embedding_np = np.array([new_embedding_vector], dtype=np.float32)
+            if new_embedding_np.shape[1] != self.embedding_dimension:
+                logger.error(f"New embedding dimension mismatch for {memory_id}. Expected {self.embedding_dimension}, got {new_embedding_np.shape[1]}.")
+                raise ValueError(f"New embedding dimension mismatch for {memory_id}.")
+
+            # Remove the old vector
+            old_faiss_id = self.memory_id_to_faiss_id[memory_id]
+            ids_to_remove = np.array([old_faiss_id], dtype=np.int64)
+            try:
+                logger.info(f"Updating vector for {memory_id}. Removing old FAISS ID {old_faiss_id}.")
+                await asyncio.to_thread(self.faiss_index.remove_ids, ids_to_remove)
+                # Clean up this specific faiss_id from faiss_id_to_memory_id.
+                # Other IDs might shift; this is a known issue with simple IndexFlatL2 remove_ids.
+                self.faiss_id_to_memory_id.pop(old_faiss_id, None)
+            except Exception as e:
+                logger.error(f"Error removing old FAISS vector for {memory_id} (FAISS ID {old_faiss_id}): {e}. Update aborted for vector part.", exc_info=True)
+                # Depending on policy, might still proceed with metadata update or raise fully.
+                # For now, if vector removal fails, we stop to avoid inconsistent state.
+                raise RuntimeError(f"Failed to remove old vector for {memory_id} during update.") from e
+
+            # Add the new vector
+            try:
+                await asyncio.to_thread(self.faiss_index.add, new_embedding_np)
+                new_faiss_id = self.faiss_index.ntotal - 1 # New FAISS ID for the re-added vector
+                self.memory_id_to_faiss_id[memory_id] = new_faiss_id # Update mapping
+                self.faiss_id_to_memory_id[new_faiss_id] = memory_id # Update reverse mapping
+                logger.info(f"Successfully replaced vector for {memory_id}. New FAISS ID: {new_faiss_id}.")
+            except Exception as e:
+                logger.error(f"Error adding new FAISS vector for {memory_id} during update: {e}. State might be inconsistent.", exc_info=True)
+                # At this point, old vector is removed but new one failed to add.
+                # This is a problematic state. Clean up memory_id_to_faiss_id for consistency.
+                self.memory_id_to_faiss_id.pop(memory_id, None)
+                raise RuntimeError(f"Failed to add new vector for {memory_id} during update.") from e
+
+        # Update metadata (remaining keys in `updates` or all if no new embedding)
+        if memory_id in self.memory_id_metadata:
+            self.memory_id_metadata[memory_id].update(updates) # Merge updates into existing metadata
+            logger.info(f"Updated metadata for memory_id '{memory_id}'. New metadata (or subset if vector changed): {updates}")
+        else:
+            # This case should ideally not be hit if memory_id was found in memory_id_to_faiss_id
+            # but implies metadata was missing.
+            self.memory_id_metadata[memory_id] = updates
+            logger.warning(f"Metadata for memory_id '{memory_id}' was missing, now set to: {updates}")
+
+        # Note: If only metadata was updated and vector was not replaced, FAISS ID mappings remain the same.
+        # If vector was replaced, mappings were updated during that process.
 
 
 class FileSystemRawContentStore(RawContentStore):

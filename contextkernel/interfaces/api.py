@@ -161,34 +161,78 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 # --- API Endpoints ---
 
-@app.post("/chat", response_model=ContextResponse, tags=["Chat"])
+# Define StreamMessage here if it's not imported from main.py or a shared types module
+# This should ideally be imported from where it's defined (e.g., main.py or a types.py)
+# For now, defining a local version for this file's context.
+# from contextkernel.main import StreamMessage # Ideal import
+from dataclasses import dataclass
+import asyncio # For asyncio.Queue
+
+@dataclass
+class StreamMessage: # Local definition, ensure it matches the one in main.py
+    content: str
+    source: str
+    metadata: Optional[Dict[str, Any]] = None
+
+
+async def get_conversation_queue(request: Request) -> asyncio.Queue:
+    if not hasattr(request.app.state, 'conversation_queue') or request.app.state.conversation_queue is None:
+        logger.error("Conversation queue not initialized or not found in app.state.")
+        # This is a server configuration error, so 500 or 503 might be appropriate
+        raise HTTPException(status_code=503, detail="Message queue is not available.")
+    return request.app.state.conversation_queue
+
+class ChatAcceptedResponse(BaseModel):
+    status: str = "Message received for processing"
+    session_id: Optional[str] = None
+    message_id: Optional[str] = None # Could be useful for client to track message
+
+@app.post("/chat",
+            response_model=ChatAcceptedResponse,
+            status_code=202, # HTTP 202 Accepted
+            tags=["Chat"],
+            summary="Accepts a chat message for asynchronous processing.")
 async def chat_endpoint(
     chat_message: ChatMessage,
-    agent: ContextAgent = Depends(get_context_agent),
-    state_manager: AbstractStateManager = Depends(get_state_manager)
+    queue: asyncio.Queue = Depends(get_conversation_queue)
+    # state_manager: AbstractStateManager = Depends(get_state_manager) # State manager might not be directly used here anymore
 ):
     """
-    Receives a chat message, processes it through the ContextAgent,
-    and returns a contextual response.
+    Receives a chat message and puts it onto the conversation stream (queue)
+    for asynchronous processing by the cognitive loops. Returns an immediate
+    202 Accepted response.
     """
     logger.info(f"Received POST /chat request for user '{chat_message.user_id}', session '{chat_message.session_id}', message: '{chat_message.message[:50]}...'")
+
+    # Create a unique ID for this message if needed for tracking, or use session_id
+    # For now, session_id from ChatMessage can be part of metadata.
+    # A more robust system might generate a unique message ID here.
+
+    stream_msg = StreamMessage(
+        content=chat_message.message,
+        source=f"api_chat_user_{chat_message.user_id}",
+        metadata={
+            "user_id": chat_message.user_id,
+            "session_id": chat_message.session_id,
+            "received_at": datetime.datetime.utcnow().isoformat(), # Using standard library datetime
+            **(chat_message.metadata or {})
+        }
+    )
+
     try:
-        # The ContextAgent's handle_chat method is responsible for managing state via the state_manager
-        response = await agent.handle_chat(
-            chat_message=chat_message,
-            session_id=chat_message.session_id, # Pass session_id explicitly
-            state_manager=state_manager
+        await queue.put(stream_msg)
+        logger.info(f"Message from user '{chat_message.user_id}' (session: {chat_message.session_id}) enqueued successfully.")
+        return ChatAcceptedResponse(
+            session_id=chat_message.session_id,
+            # message_id= ... # if a unique message ID was generated
         )
-        logger.info(f"Successfully processed /chat request for session '{response.context_id}', reply: '{str(response.data.get('reply','N/A'))[:50]}...'")
-        return response
-    except CoreLogicError as e: # Example of more specific error handling if needed at endpoint level
-        logger.error(f"CoreLogicError in /chat for session {chat_message.session_id}: {e}", exc_info=True)
-        raise # Re-raise to be caught by the global handler
+    except asyncio.QueueFull:
+        logger.error(f"Conversation queue is full. Cannot accept message from user '{chat_message.user_id}'.")
+        raise HTTPException(status_code=503, detail="Server is busy, please try again later. Queue is full.")
     except Exception as e:
-        logger.error(f"Unexpected error in /chat for session {chat_message.session_id}: {e}", exc_info=True)
-        # Re-raise the original exception to be caught by the global generic_exception_handler
-        # for consistent error response formatting.
-        raise e
+        logger.error(f"Unexpected error enqueuing message in /chat for user {chat_message.user_id}: {e}", exc_info=True)
+        # This is an internal server error if putting to queue fails unexpectedly
+        raise HTTPException(status_code=500, detail="Failed to enqueue message for processing.")
 
 
 @app.post("/ingest", response_model=IngestResponse, status_code=202, tags=["Data Ingestion"])
