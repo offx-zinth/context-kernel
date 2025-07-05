@@ -210,7 +210,7 @@ class RawCache:
 
             if new_ttl_seconds <= 0:
                 logger.warning(f"Calculated new TTL for key '{actual_key}' is non-positive ({new_ttl_seconds}s). Deleting key instead.")
-                await self.delete(actual_key, namespace) # Or let it expire naturally if behavior is preferred
+                await self.delete(key=actual_key, namespace=None) # Pass actual_key directly as it's already namespaced
                 return False
 
             # Set the new expiration time in seconds from now
@@ -224,6 +224,22 @@ class RawCache:
         except Exception as e:
             logger.error(f"Error extending TTL for key '{actual_key}' in Redis: {e}")
             return False
+
+    async def delete_raw_data(self, doc_id: str) -> None:
+        """
+        Deletes raw data associated with doc_id.
+        This is a convenience method that calls self.delete with a predefined namespace
+        assumed for raw data storage by MemoryManager.
+        """
+        # Assuming MemoryManager stores raw data under a specific namespace, e.g., "raw_content"
+        # If no specific namespace is used by MemoryManager for RawCache, then namespace=None.
+        # For now, let's assume a namespace like "raw_data" or "main_content".
+        # The MemoryManager.store logic currently doesn't show it using RawCache for the primary raw data,
+        # but rather linking to a RawCacheEntry node in the graph.
+        # This implies that the raw_data_id IS the key in RawCache.
+        # Let's assume no specific namespace is added by MemoryManager when using RawCache directly.
+        logger.info(f"RawCache: Deleting raw data for doc_id '{doc_id}'.")
+        await self.delete(key=doc_id, namespace=None) # Or a specific namespace if defined by usage patterns
 
     # clear_expired_keys is not needed as Redis handles this automatically.
 

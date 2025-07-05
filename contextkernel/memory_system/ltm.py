@@ -1609,6 +1609,62 @@ class LTM:
         logger.info("LTM Cleaning process scheduled (stubbed - no actual client interaction).")
         await asyncio.sleep(0.01) # Simulate async operation
 
+    async def update_document(self, memory_id: str, updates: Dict[str, Any]) -> None:
+        """
+        Updates an LTM document, which primarily means updating its vector embedding and/or metadata
+        in the underlying VectorDB. Raw content update is not directly handled here as LTM
+        primarily deals with embeddings derived from content.
+        If 'embedding' is part of updates, the vector is replaced.
+        Other parts of 'updates' are treated as metadata updates for the vector.
+        """
+        if not self.vector_db:
+            logger.error("LTM.vector_db not initialized. Cannot update document.")
+            raise RuntimeError("LTM.vector_db not initialized.")
+        logger.info(f"LTM: Updating document/embedding for memory_id '{memory_id}'. Updates: {list(updates.keys())}")
+        await self.vector_db.update_embedding(memory_id, updates)
+        logger.info(f"LTM: Update call for memory_id '{memory_id}' delegated to VectorDB.")
+
+    async def delete_document(self, memory_id: str) -> None:
+        """
+        Deletes an LTM document. This involves:
+        1. Deleting the embedding from the VectorDB.
+        2. Deleting the associated raw content from the RawContentStore.
+        """
+        if not self.vector_db or not self.raw_content_store:
+            logger.error("LTM components (VectorDB or RawContentStore) not initialized. Cannot delete document.")
+            raise RuntimeError("LTM components not initialized for delete_document.")
+
+        logger.info(f"LTM: Attempting to delete document for memory_id '{memory_id}'.")
+
+        # 1. Get metadata from VectorDB to find raw_content_id (if it exists)
+        raw_content_id_to_delete = None
+        try:
+            vector_db_metadata = await self.vector_db.get_metadata_by_id(memory_id)
+            if vector_db_metadata:
+                raw_content_id_to_delete = vector_db_metadata.get("raw_content_id")
+        except Exception as e_meta:
+            logger.warning(f"LTM: Error fetching metadata for {memory_id} before deletion (continuing with vector deletion): {e_meta}")
+
+        # 2. Delete from VectorDB
+        try:
+            await self.vector_db.delete_embedding(memory_id)
+            logger.info(f"LTM: Embedding for memory_id '{memory_id}' deleted from VectorDB.")
+        except Exception as e_vec:
+            logger.error(f"LTM: Error deleting embedding for {memory_id} from VectorDB: {e_vec}", exc_info=True)
+            # Depending on policy, might stop or continue to delete raw content if ID known
+
+        # 3. Delete from RawContentStore if raw_content_id was found
+        if raw_content_id_to_delete:
+            try:
+                await self.raw_content_store.delete_content(raw_content_id_to_delete)
+                logger.info(f"LTM: Raw content '{raw_content_id_to_delete}' for memory_id '{memory_id}' deleted from RawContentStore.")
+            except Exception as e_raw:
+                logger.error(f"LTM: Error deleting raw content '{raw_content_id_to_delete}' for {memory_id}: {e_raw}", exc_info=True)
+        else:
+            logger.info(f"LTM: No raw_content_id found or fetched for memory_id '{memory_id}'. Skipping raw content deletion.")
+
+        logger.info(f"LTM: Deletion process for memory_id '{memory_id}' completed.")
+
 
 async def main():
     """Example usage of the LTM system with FAISSVectorDB and FileSystemRawContentStore."""
