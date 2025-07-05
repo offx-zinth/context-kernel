@@ -2,38 +2,36 @@ import logging
 import uvicorn # For running the FastAPI app
 import sys
 import asyncio # Added for asyncio functionality
-from typing import Optional, Any, Dict, NamedTuple # For type hinting
+from typing import Optional, Any, Dict, List # Updated List import
 from dataclasses import dataclass # For StreamMessage
+import datetime # For PlaceholderStructuredInsight, and raw_data_id generation in loop
 
 # ContextKernel imports
 from contextkernel.utils.config import get_settings, AppSettings, ConfigurationError
 from contextkernel.interfaces.api import app as fastapi_app
 from contextkernel.utils.state_manager import (
     AbstractStateManager,
-    RedisStateManager,
-    InMemoryStateManager,
+    # RedisStateManager, # Not directly used in main_async after refactor
+    # InMemoryStateManager,
 )
 # Actual core logic components will be imported
-from contextkernel.core_logic.llm_listener import LLMListener # Renamed to ContextAgent later in plan
-from contextkernel.core_logic.llm_retriever import LLMRetriever
-from contextkernel.core_logic.hallucination_detector import HallucinationDetector # New import
-from contextkernel.memory_system.memory_manager import MemoryManager # New import
+from contextkernel.core_logic.llm_listener import ContextAgent, ContextAgentConfig, StructuredInsight # LLMListener renamed to ContextAgent
+from contextkernel.core_logic.llm_retriever import LLMRetriever, LLMRetrieverConfig
+from contextkernel.core_logic.hallucination_detector import HallucinationDetector
+from contextkernel.memory_system.memory_manager import MemoryManager
+from contextkernel.core_logic.chunker import SemanticChunker
+from contextkernel.core_logic.nlp_utils import initialize_matcher, NLPConfig # For SemanticChunker setup
+import spacy # For SemanticChunker setup
+
 # Import interfaces for MemoryManager dependencies
-from contextkernel.memory_system.graph_db import GraphDBInterface # Assuming interface exists
-from contextkernel.memory_system.ltm import LTMInterface # Assuming interface exists
-from contextkernel.memory_system.stm import STMInterface # Assuming interface exists
-from contextkernel.memory_system.raw_cache import RawCacheInterface # Assuming interface exists
+from contextkernel.memory_system.graph_db import GraphDBInterface
+from contextkernel.memory_system.ltm import LTMInterface
+from contextkernel.memory_system.stm import STMInterface
+from contextkernel.memory_system.raw_cache import RawCacheInterface
 
-
-# Import module configurations
-from contextkernel.core_logic import NLPConfig
-from contextkernel.core_logic.llm_listener import LLMListenerConfig
-from contextkernel.core_logic.llm_retriever import LLMRetrieverConfig
-# from contextkernel.core_logic.summarizer import SummarizerConfig # Summarizer is part of LLMListener/ContextAgent now
 
 # Mock LLM client for now (or actual client if configured)
 from contextkernel.tests.mocks.mock_llm import MockLLM # DEV only, replace with actual
-# from some_llm_library import ActualLLMClient # Example for real client
 
 # Get a logger instance for this module
 logger = logging.getLogger(__name__)
@@ -46,10 +44,7 @@ class StreamMessage:
     metadata: Optional[Dict[str, Any]] = None
 
 
-# --- Placeholder Core Logic Classes (to be replaced by actual imports) ---
-# These are temporary until the actual classes are fully implemented and imported.
-# Ensure these placeholders match the expected signatures for now.
-
+# --- Placeholder Core Logic Classes ---
 class PlaceholderGraphDB(GraphDBInterface):
     async def create_node(self, node_id: str, data: Dict, label: Optional[str] = None): logger.info(f"MockGraphDB: Create node {node_id}")
     async def get_node(self, node_id: str) -> Optional[Dict]: logger.info(f"MockGraphDB: Get node {node_id}"); return None
@@ -57,20 +52,30 @@ class PlaceholderGraphDB(GraphDBInterface):
     async def delete_node(self, node_id: str): logger.info(f"MockGraphDB: Delete node {node_id}")
     async def create_relationship(self, source_id: str, target_id: str, rel_type: str, properties: Optional[Dict] = None): logger.info(f"MockGraphDB: Create relationship {source_id}-{rel_type}->{target_id}")
     async def query(self, cypher_query: str, params: Optional[Dict] = None) -> Any: logger.info(f"MockGraphDB: Query {cypher_query}"); return []
+    async def ensure_source_document_node(self, document_id: str, properties: Dict): logger.info(f"MockGraphDB: Ensure SourceDocument node {document_id} with props {list(properties.keys())}")
+    async def add_memory_fragment_link(self, document_id: str, fragment_id: str, fragment_main_label: str, relationship_type: str, fragment_properties: Dict): logger.info(f"MockGraphDB: Add fragment link {document_id} -> {fragment_id} ({fragment_main_label} via {relationship_type})")
+    async def add_entities_to_document(self, document_id: str, entities: list): logger.info(f"MockGraphDB: Add {len(entities)} entities to {document_id}")
+    async def add_relations_to_document(self, document_id: str, relations: list): logger.info(f"MockGraphDB: Add {len(relations)} relations to {document_id}")
 
 class PlaceholderLTM(LTMInterface):
     async def store_embedding(self, doc_id: str, embedding: Any, metadata: Dict): logger.info(f"MockLTM: Store embedding {doc_id}")
     async def get_embedding(self, doc_id: str) -> Optional[Any]: logger.info(f"MockLTM: Get embedding {doc_id}"); return None
-    async def search_similar(self, query_embedding: Any, top_k: int = 5) -> list: logger.info(f"MockLTM: Search similar"); return []
-    async def delete_embedding(self, memory_id: str): logger.info(f"MockLTM: Delete embedding {memory_id}") # Added for MemoryManager
-    async def update_embedding(self, memory_id: str, updates: Dict): logger.info(f"MockLTM: Update embedding {memory_id}") # Added for MemoryManager
+    async def search_similar(self, query_embedding: Any, top_k: int = 5) -> list: logger.info(f"MockLTM: Search similar for query (embedding preview: {str(query_embedding)[:30]}...) top_k={top_k}"); return []
+    async def delete_document(self, memory_id: str): logger.info(f"MockLTM: Delete document (embedding and raw) for {memory_id}")
+    async def update_document(self, memory_id: str, updates: Dict): logger.info(f"MockLTM: Update document (embedding and metadata) for {memory_id} with updates {list(updates.keys())}")
+    # LTMInterface might need store_document, get_document, etc. if MemoryManager calls those directly.
+    # For now, assuming MemoryManager uses store_embedding, search_similar, delete_document, update_document.
+    # Adding save_document as it's called by MemoryManager.store
+    async def save_document(self, doc_id: str, text_content: str, embedding: List[float], metadata: Optional[Dict[str, Any]]=None) -> None: logger.info(f"MockLTM: Save document {doc_id}, text: '{text_content[:50]}...'")
 
 
 class PlaceholderSTM(STMInterface):
     async def store_summary(self, summary_id: str, summary_text: str, metadata: Dict): logger.info(f"MockSTM: Store summary {summary_id}")
     async def get_summary(self, summary_id: str) -> Optional[str]: logger.info(f"MockSTM: Get summary {summary_id}"); return None
-    async def delete_summary(self, summary_id: str): logger.info(f"MockSTM: Delete summary {summary_id}") # Added for MemoryManager
-    async def update_summary(self, summary_id: str, updates: Dict): logger.info(f"MockSTM: Update summary {summary_id}") # Added for MemoryManager
+    async def delete_summary(self, summary_id: str): logger.info(f"MockSTM: Delete summary {summary_id}")
+    async def update_summary(self, summary_id: str, updates: Dict): logger.info(f"MockSTM: Update summary {summary_id}")
+    # Adding save_summary as it's called by MemoryManager.store
+    async def save_summary(self, summary_id: str, summary_obj: Any, metadata: Optional[Dict[str, Any]]=None) -> None: logger.info(f"MockSTM: Save summary {summary_id}, obj_type: {type(summary_obj)}")
 
 
 class PlaceholderRawCache(RawCacheInterface):
@@ -82,7 +87,7 @@ class PlaceholderRawCache(RawCacheInterface):
 # --- Cognitive Loop Functions ---
 async def write_and_verify_loop(
     queue: asyncio.Queue,
-    context_agent: LLMListener, # Will be renamed to ContextAgent
+    context_agent: ContextAgent, # Updated type hint
     detector: HallucinationDetector,
     mem_manager: MemoryManager
 ):
@@ -91,63 +96,45 @@ async def write_and_verify_loop(
         message: StreamMessage = await queue.get()
         logger.info(f"[WriteLoop] Received message from source '{message.source}': {message.content[:50]}...")
         try:
-            # 1. Process data with ContextAgent (now returns List[StructuredInsight])
-            # The actual ContextAgent.process_data is async.
-            structured_insights: List[Any] # Type hint for clarity, use actual StructuredInsight later
+            # 1. Process data with ContextAgent
+            structured_insights: List[StructuredInsight] = await context_agent.process_data(
+                raw_data_content=message.content,
+                context_instructions=message.metadata.get("context_instructions") if message.metadata else None
+            )
+            logger.info(f"[WriteLoop] ContextAgent processed message, generated {len(structured_insights)} insight(s).")
 
-            # Placeholder for actual StructuredInsight and process_data call
-            # This part will be uncommented and adjusted when actual ContextAgent is used.
-            # structured_insights = await context_agent.process_data(message.content)
-
-            # --- Mocking ContextAgent's output for now ---
-            class PlaceholderStructuredInsight: # Keep this for mock if needed
-                def __init__(self, text, chunk_num=0):
-                    self.summary = NamedTuple("Summary", text=str)(text=f"Summary of: {text} (chunk {chunk_num})")
-                    self.raw_content = text # Example field for the chunk's content
-                    # Add other fields like entities, relations as needed by downstream components
-                    self.entities = []
-                    self.relations = []
-                    self.content_embedding = []
-                    self.raw_data_id = f"raw_{message.source}_{chunk_num}" # Example
-                    self.original_data_type = "text_chunk"
-                    self.created_at = datetime.datetime.utcnow() # Requires datetime import
-                    self.updated_at = datetime.datetime.utcnow()
-
-
-            # Simulate ContextAgent returning a list of insights (e.g., one per chunk)
-            # For this placeholder, let's assume one insight for simplicity of the mock.
-            # In reality, context_agent.process_data(message.content) would return a list.
-            # Example: structured_insights = [PlaceholderStructuredInsight(f"{message.content} - chunk {i+1}") for i in range(2)]
-            structured_insights = [PlaceholderStructuredInsight(message.content, chunk_num=0)] # Mock: one insight for now
-            logger.info(f"[WriteLoop] ContextAgent processed message, got {len(structured_insights)} insight(s).")
-            # --- End Mocking ContextAgent output ---
+            if not structured_insights:
+                logger.info(f"[WriteLoop] No insights generated for message: {message.content[:50]}...")
+                queue.task_done()
+                continue
 
             for insight_idx, current_insight in enumerate(structured_insights):
-                logger.info(f"[WriteLoop] Processing insight {insight_idx+1}/{len(structured_insights)}: {current_insight.summary.text[:50]}...")
+                # Determine content for validation (e.g., summary or original preview)
+                content_to_validate = current_insight.summary.text if current_insight.summary and current_insight.summary.text else current_insight.source_data_preview
 
-                # 2. Detect hallucinations for the current insight's summary
-                # validation_result = await detector.detect(current_insight.summary.text) # Actual call
+                if not content_to_validate:
+                    logger.warning(f"[WriteLoop] Insight {insight_idx+1} has no content (summary/preview) for validation. Skipping.")
+                    continue
 
-                # --- Mocking HallucinationDetector output ---
-                class PlaceholderValidationResult: # Keep for mock
-                    def __init__(self, is_valid, details, past_occurrences=None):
-                        self.is_valid = is_valid
-                        self.details = details
-                        self.past_occurrences = past_occurrences or []
-                validation_result = PlaceholderValidationResult(is_valid=True, details="Mock validation passed")
-                # --- End Mocking HallucinationDetector ---
-                logger.info(f"[WriteLoop] Validation for insight {insight_idx+1}: {validation_result.is_valid} ({validation_result.details})")
+                logger.info(f"[WriteLoop] Validating insight {insight_idx+1}/{len(structured_insights)}: Preview '{content_to_validate[:50]}...'")
+
+                # 2. Detect hallucinations
+                validation_result = await detector.detect(content_to_validate)
+                logger.info(f"[WriteLoop] Validation for insight {insight_idx+1}: {validation_result.is_valid}. Explanation: {validation_result.explanation}")
 
                 if not validation_result.is_valid:
-                    logger.warning(f"[WriteLoop] Hallucination detected for insight {insight_idx+1} ({current_insight.summary.text[:50]}). Skipping storage for this insight.")
-                    # Optionally, store the hallucination event itself
-                    continue # Process next insight in the list
+                    logger.warning(f"[WriteLoop] Hallucination detected for insight {insight_idx+1}. Validation: {validation_result.explanation}. Skipping storage.")
+                    # Future: await mem_manager.store_hallucination_event(message, current_insight, validation_result)
+                    continue
 
-                # 3. Store the (validated) StructuredInsight using MemoryManager
-                # await mem_manager.store(current_insight) # Actual call
-                logger.info(f"[WriteLoop] Storing insight {insight_idx+1} via MemoryManager: {current_insight.summary.text[:50]}...")
-                # Mock store operation for now
-                await asyncio.sleep(0.05) # Simulate async I/O per insight
+                # 3. Store the (validated) StructuredInsight
+                # Construct a raw_data_id for insights from queued messages.
+                msg_id_part = message.metadata.get("message_id", f"{message.source}_{message.metadata.get('received_at', str(datetime.datetime.utcnow().timestamp()))}") if message.metadata else f"{message.source}_{str(datetime.datetime.utcnow().timestamp())}"
+                current_insight.raw_data_id = f"insight_msg_{msg_id_part}_chunk_{insight_idx}"
+
+                logger.info(f"[WriteLoop] Storing insight {insight_idx+1} (ID: {current_insight.raw_data_id}) via MemoryManager.")
+                await mem_manager.store(current_insight)
+                logger.info(f"[WriteLoop] Insight {current_insight.raw_data_id} stored successfully.")
 
         except Exception as e:
             logger.error(f"[WriteLoop] Error processing message '{message.content[:50]}...': {e}", exc_info=True)
@@ -155,7 +142,7 @@ async def write_and_verify_loop(
             queue.task_done()
 
 async def read_and_inject_loop(
-    queue: asyncio.Queue,
+    queue: asyncio.Queue, # This loop also listens to the same queue
     retriever: LLMRetriever
 ):
     logger.info("Read-and-Inject Loop started.")
@@ -163,30 +150,36 @@ async def read_and_inject_loop(
         message: StreamMessage = await queue.get()
         logger.info(f"[ReadLoop] Received message from source '{message.source}': {message.content[:50]}...")
         try:
-            # 1. Retrieve relevant context
-            # retrieved_context = await retriever.retrieve(message.content) # Assuming async and retrieve takes simple query
-            # For now, using a placeholder for retrieved_context
-            retrieved_context = [f"Mock context related to: {message.content[:30]}"]
-            logger.info(f"[ReadLoop] Retrieved context: {retrieved_context}")
+            # 1. Retrieve relevant context using LLMRetriever
+            task_description = message.metadata.get("task_description") if message.metadata else None
+            filters = message.metadata.get("retrieval_filters") if message.metadata else None
+
+            retrieval_response = await retriever.retrieve(
+                query=message.content,
+                task_description=task_description,
+                filters=filters
+                # top_k can be configured in LLMRetrieverConfig or passed here
+            )
+            logger.info(f"[ReadLoop] Retriever found {len(retrieval_response.items)} items. Message: {retrieval_response.message}")
 
             # 2. Inject context (for now, print/log)
-            # In a full app, this might push to another queue for UI/LLM or directly update a shared state.
-            if retrieved_context:
-                logger.info(f"[ReadLoop] Injecting context for '{message.content[:50]}...': {retrieved_context}")
+            if retrieval_response.items:
+                logger.info(f"[ReadLoop] Context for '{message.content[:50]}...':")
+                for item_idx, item in enumerate(retrieval_response.items):
+                    score_display = f"{item.score:.4f}" if item.score is not None else "N/A"
+                    logger.info(f"  Item {item_idx+1}: Source='{item.source}', Score={score_display}, Content='{str(item.content)[:100]}...'")
+                    # Example: await context_broadcaster.send_context(message.metadata.get("session_id"), item)
             else:
-                logger.info(f"[ReadLoop] No context found for '{message.content[:50]}...'")
-
-            # Simulate work
-            await asyncio.sleep(0.1)
+                logger.info(f"[ReadLoop] No relevant context found by retriever for '{message.content[:50]}...'")
 
         except Exception as e:
-            logger.error(f"[ReadLoop] Error processing message: {e}", exc_info=True)
+            logger.error(f"[ReadLoop] Error processing message for retrieval: {e}", exc_info=True)
         finally:
             queue.task_done()
 
 
 # --- Global State Manager ---
-state_manager_instance: Optional[AbstractStateManager] = None
+state_manager_instance: Optional[AbstractStateManager] = None # Remains for potential other uses, but not central to loops
 
 def setup_logging(log_level_str: str, debug_mode: bool):
     log_level = getattr(logging, log_level_str.upper(), logging.INFO)
@@ -194,7 +187,7 @@ def setup_logging(log_level_str: str, debug_mode: bool):
         log_level = logging.DEBUG
     logging.basicConfig(
         level=log_level,
-        format="%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s] - %(message)s", # Added funcName
+        format="%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s] - %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)]
     )
     logger.info(f"Logging configured with level: {logging.getLevelName(log_level)}")
@@ -211,104 +204,139 @@ async def shutdown_event():
 
     if hasattr(fastapi_app.state, 'llm_client') and fastapi_app.state.llm_client and hasattr(fastapi_app.state.llm_client, 'close'):
         logger.info("Closing LLM client...")
-        if hasattr(fastapi_app.state.llm_client.close, "__call__"): # Check if close is callable
-             # Assuming close is synchronous for mock, make async if real client needs it
+        if hasattr(fastapi_app.state.llm_client.close, "__call__"):
             if asyncio.iscoroutinefunction(fastapi_app.state.llm_client.close):
                 await fastapi_app.state.llm_client.close()
             else:
                 fastapi_app.state.llm_client.close()
         logger.info("LLM client closed.")
 
-    # Cancel asyncio tasks
     if hasattr(fastapi_app.state, 'cognitive_tasks'):
         logger.info("Cancelling cognitive loop tasks...")
         for task in fastapi_app.state.cognitive_tasks:
-            task.cancel()
-        await asyncio.gather(*fastapi_app.state.cognitive_tasks, return_exceptions=True)
-        logger.info("Cognitive loop tasks cancelled.")
+            if not task.done(): # Check if task is not already done
+                 task.cancel()
+        try:
+            await asyncio.gather(*fastapi_app.state.cognitive_tasks, return_exceptions=True)
+            logger.info("Cognitive loop tasks awaited after cancellation.")
+        except asyncio.CancelledError:
+            logger.info("Cognitive loop tasks were cancelled as expected.")
+        except Exception as e:
+            logger.error(f"Error during cognitive_tasks gather on shutdown: {e}", exc_info=True)
+
+    # Close Spacy model if loaded and attached
+    if hasattr(fastapi_app.state, 'nlp_spacy') and fastapi_app.state.nlp_spacy is not None:
+        logger.info("Closing Spacy model (conceptual, as spacy.Language objects don't have explicit close).")
+        fastapi_app.state.nlp_spacy = None # Allow garbage collection
+
+    logger.info("FastAPI app shutdown sequence complete.")
 
 
-async def main_async(): # Renamed to main_async to clearly indicate it's an async entry point
+async def main_async():
     global state_manager_instance
-    # 1. Load Application Configuration
     try:
         config: AppSettings = get_settings()
     except ConfigurationError as e:
-        logging.basicConfig(level=logging.ERROR) # BasicConfig if setup_logging hasn't run
+        logging.basicConfig(level=logging.ERROR)
         logger.error(f"Fatal error: Could not load application settings. {e}", exc_info=True)
         sys.exit(1)
 
-    # 2. Setup Logging
     setup_logging(log_level_str=config.server.log_level, debug_mode=config.debug_mode)
-
     logger.info(f"Starting {config.app_name} v{config.version} (Async Mode)")
-    logger.info(f"Debug Mode: {'Enabled' if config.debug_mode else 'Disabled'}")
-    logger.info(f"State Manager Type: {config.state_manager_type}")
 
-    # 3. Initialize StateManager (if needed by core components directly, otherwise MemoryManager handles it)
-    # For now, MemoryManager will instantiate its own DB interfaces.
-    # If a global state manager is still needed for other purposes:
-    if config.state_manager_type.lower() == "redis":
-        # ... (state manager init code as before)
-        pass # Placeholder, assuming MemoryManager handles its DBs
-
-    # 4. Initialize LLM Client(s)
-    logger.info("Initializing LLM client...")
     if config.llm.api_key:
         llm_client = MockLLM(api_key=config.llm.api_key.get_secret_value(), model=config.llm.model or "mock-model-pro")
     else:
         llm_client = MockLLM(model=config.llm.model or "mock-model-basic")
     logger.info(f"{llm_client.__class__.__name__} initialized for LLM operations.")
+    fastapi_app.state.llm_client = llm_client # Attach to app state for potential use/shutdown
 
-    # 5. Initialize Core Logic Components for Cognitive Loops
-    logger.info("Initializing core logic components for cognitive loops...")
-
-    # Placeholder DB interfaces for MemoryManager
-    # In a real setup, these would be actual implementations (e.g., Neo4jDB, ChromaDB, RedisCache)
+    # Initialize DB Stubs
     graph_db_instance = PlaceholderGraphDB()
     ltm_instance = PlaceholderLTM()
     stm_instance = PlaceholderSTM()
     raw_cache_instance = PlaceholderRawCache()
 
-    # Instantiate MemoryManager with all its DB dependencies
     memory_manager = MemoryManager(
         graph_db=graph_db_instance,
         ltm=ltm_instance,
         stm=stm_instance,
         raw_cache=raw_cache_instance
     )
-    logger.info("MemoryManager initialized.")
+    logger.info("MemoryManager initialized with mock DBs.")
 
-    # Instantiate LLMListener (to be renamed ContextAgent)
-    # This is the "Write" track's processor.
-    # Assuming LLMListenerConfig is available in config.listener
-    context_agent_processor = LLMListener(config=config.listener, llm_client=llm_client) # Name change: listener -> context_agent_processor
-    logger.info("ContextAgent (LLMListener) initialized for write track.")
+    # Initialize SemanticChunker dependencies
+    if not hasattr(config, 'nlp_settings') or not isinstance(config.nlp_settings, NLPConfig):
+        logger.warning("AppSettings 'nlp_settings' not found or not NLPConfig. Using default NLPConfig.")
+        nlp_config = NLPConfig()
+    else:
+        nlp_config = config.nlp_settings
 
-    # Instantiate LLMRetriever for the "Read" track
-    llm_retriever = LLMRetriever(config=config.retriever, llm_client=llm_client)
-    logger.info("LLMRetriever initialized for read track.")
+    nlp_spacy = None
+    try:
+        nlp_spacy = spacy.load(nlp_config.spacy_model_name)
+        logger.info(f"Spacy model '{nlp_config.spacy_model_name}' loaded.")
+        fastapi_app.state.nlp_spacy = nlp_spacy # For potential shutdown
+    except OSError:
+        logger.error(f"Spacy model '{nlp_config.spacy_model_name}' not found. Chunker functionality will be limited.")
 
-    # Instantiate HallucinationDetector
-    # It will need the LLMRetriever for checking past occurrences.
-    hallucination_detector = HallucinationDetector(llm_client=llm_client, retriever=llm_retriever) # Added retriever
+    spacy_matcher = initialize_matcher(nlp_spacy) if nlp_spacy else None
+    if spacy_matcher: logger.info("Spacy Matcher initialized.")
+
+    semantic_chunker = SemanticChunker(
+        nlp_model=nlp_spacy,
+        matcher=spacy_matcher,
+        intent_classifier=None, # Using None for intent_classifier for now
+        use_spacy_matcher_first=nlp_config.use_spacy_matcher_first,
+        intent_candidate_labels=nlp_config.intent_candidate_labels,
+        default_intent_confidence=nlp_config.default_intent_confidence,
+        high_confidence_threshold=nlp_config.high_confidence_threshold
+    )
+    logger.info("SemanticChunker initialized.")
+
+    # Initialize LLMRetriever (used by HallucinationDetector and ReadLoop)
+    # Assuming retriever_config is named 'retriever' in AppSettings
+    if not hasattr(config, 'retriever') or not isinstance(config.retriever, LLMRetrieverConfig):
+        logger.warning("AppSettings 'retriever' settings not found or not LLMRetrieverConfig. Using default LLMRetrieverConfig.")
+        retriever_config = LLMRetrieverConfig()
+    else:
+        retriever_config = config.retriever
+
+    llm_retriever = LLMRetriever(
+        retriever_config=retriever_config,
+        ltm_interface=ltm_instance,
+        stm_interface=stm_instance,
+        graphdb_interface=graph_db_instance,
+        query_llm=llm_client
+    )
+    logger.info("LLMRetriever initialized.")
+
+    hallucination_detector = HallucinationDetector(llm_client=llm_client, retriever=llm_retriever)
     logger.info("HallucinationDetector initialized.")
 
+    # Initialize ContextAgent
+    # Assuming context_agent config is named 'context_agent' in AppSettings
+    if not hasattr(config, 'context_agent') or not isinstance(config.context_agent, ContextAgentConfig):
+        logger.warning("AppSettings 'context_agent' settings not found or not ContextAgentConfig. Using default ContextAgentConfig.")
+        context_agent_config_instance = ContextAgentConfig()
+    else:
+        context_agent_config_instance = config.context_agent
 
-    # 6. Create Shared asyncio.Queue
+    context_agent_processor = ContextAgent(
+        config=context_agent_config_instance,
+        chunker=semantic_chunker,
+        hallucination_detector=hallucination_detector,
+        memory_manager=memory_manager,
+        llm_client=llm_client
+    )
+    logger.info("ContextAgent initialized.")
+
     conversation_queue = asyncio.Queue()
-    logger.info("Shared asyncio.Queue (conversation_stream) created.")
+    fastapi_app.state.conversation_queue = conversation_queue
+    fastapi_app.state.settings = config # Make settings available to API endpoints
+    # Attach other components if needed by API endpoints directly (besides loops)
+    fastapi_app.state.context_agent_for_ingest = context_agent_processor # For /ingest
 
-    # 7. Attach instances to fastapi_app.state for Dependency Injection
-    logger.info("Attaching core components and queue to FastAPI app state...")
-    fastapi_app.state.settings = config
-    # fastapi_app.state.state_manager = state_manager_instance # If global state manager is used
-    fastapi_app.state.llm_client = llm_client
-    fastapi_app.state.conversation_queue = conversation_queue # For /chat endpoint
-    # The cognitive loops will get their dependencies passed directly, not via app.state typically
-    logger.info("Core components and queue attached to app state.")
-
-    # 8. Create and Start Cognitive Loop Tasks
     logger.info("Creating cognitive loop tasks...")
     write_task = asyncio.create_task(
         write_and_verify_loop(
@@ -320,29 +348,22 @@ async def main_async(): # Renamed to main_async to clearly indicate it's an asyn
     )
     read_task = asyncio.create_task(
         read_and_inject_loop(
-            queue=conversation_queue, # Both loops listen to the same queue
+            queue=conversation_queue,
             retriever=llm_retriever
         )
     )
-    fastapi_app.state.cognitive_tasks = [write_task, read_task] # For graceful shutdown
+    fastapi_app.state.cognitive_tasks = [write_task, read_task]
     logger.info("Cognitive loop tasks created.")
 
-    # 9. Start the API Server (if enabled)
     server_task = None
     if config.server.enabled:
-        logger.info(
-            f"API Server enabled. Starting Uvicorn on "
-            f"{config.server.host}:{config.server.port} "
-            f"with log level: {config.server.log_level.lower()}"
-        )
-        # Uvicorn needs to be configured to run within an existing asyncio loop
+        logger.info(f"API Server enabled. Starting Uvicorn on {config.server.host}:{config.server.port}")
         server_config = uvicorn.Config(
             app=fastapi_app,
             host=config.server.host,
             port=config.server.port,
             log_level=config.server.log_level.lower(),
-            # reload=config.debug_mode, # Not ideal with asyncio tasks, handle reload carefully
-            lifespan="on" # Ensure lifespan events (startup/shutdown) are handled
+            lifespan="on"
         )
         server = uvicorn.Server(server_config)
         server_task = asyncio.create_task(server.serve())
@@ -350,12 +371,8 @@ async def main_async(): # Renamed to main_async to clearly indicate it's an asyn
     else:
         logger.info("API Server is disabled. Only cognitive loops will run.")
 
-    # 10. Run all tasks concurrently
-    tasks_to_gather = [write_task, read_task]
-    if server_task:
-        tasks_to_gather.append(server_task)
-
-    logger.info(f"Running main event loop with tasks: {tasks_to_gather}")
+    tasks_to_gather = [task for task in [write_task, read_task, server_task] if task is not None]
+    logger.info(f"Running main event loop with {len(tasks_to_gather)} tasks.")
     try:
         await asyncio.gather(*tasks_to_gather)
     except KeyboardInterrupt:
@@ -364,8 +381,7 @@ async def main_async(): # Renamed to main_async to clearly indicate it's an asyn
         logger.critical(f"Critical error in main asyncio.gather: {e}", exc_info=True)
     finally:
         logger.info(f"{config.app_name} main loop finished. Application shutting down.")
-        # Shutdown event in FastAPI will handle task cancellation and resource closing.
-
+        # FastAPI shutdown event handles task cancellations and resource closing.
 
 if __name__ == "__main__":
     try:
@@ -373,9 +389,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Application terminated by user (KeyboardInterrupt in asyncio.run).")
     except Exception as e:
-        # Fallback logger if setup_logging hasn't run or failed
         logging.basicConfig(level=logging.ERROR)
         logger.critical(f"Unhandled exception in asyncio.run: {e}", exc_info=True)
         sys.exit(1)
-
-[end of contextkernel/main.py]

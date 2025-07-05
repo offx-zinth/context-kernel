@@ -103,15 +103,24 @@ class HallucinationDetector:
                 #    target_type="hallucination_reports" # Fictional parameter
                 # )
 
-                # MOCK: Simulate retrieval for now
-                if "cheese" in chunk.lower() and "moon" in chunk.lower(): # Mock specific case
-                    past_occurrences_found = [
-                        {"id": "err_moon_cheese_001", "correction": "The moon is made of rock, not cheese.", "timestamp": "2023-01-15T10:00:00Z"}
-                    ]
-                logger.info(f"HallucinationDetector: Retrieved {len(past_occurrences_found)} past occurrences.")
+                # --- Replace MOCK with actual retriever call ---
+                retrieval_response = await self.retriever.retrieve(query=retrieval_query, top_k=3) # Example top_k
+
+                if retrieval_response and retrieval_response.items:
+                    for item in retrieval_response.items:
+                        occurrence = {
+                            "id": item.metadata.get("doc_id", item.metadata.get("id", "N/A")), # Try to get an ID
+                            "content": str(item.content), # Ensure content is string
+                            "source": item.source,
+                            "score": item.score,
+                            "metadata": item.metadata
+                        }
+                        past_occurrences_found.append(occurrence)
+                # --- End of retriever call replacement ---
+                logger.info(f"HallucinationDetector: Retriever found {len(past_occurrences_found)} past occurrences for query about '{chunk[:30]}...'.")
 
             except Exception as e_ret:
-                logger.error(f"Error during retriever call in HallucinationDetector: {e_ret}", exc_info=True)
+                logger.error(f"Error during retriever call in HallucinationDetector for query '{retrieval_query}': {e_ret}", exc_info=True)
                 # Append to explanation or handle as needed
                 llm_explanation += f" | Retriever error: {str(e_ret)}"
 

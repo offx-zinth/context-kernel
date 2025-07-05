@@ -1,57 +1,44 @@
 import logging
 from typing import Any, Dict, Optional, Union
-from abc import ABC, abstractmethod
+import datetime # Added import
+# Removed ABC imports as placeholder ContextAgent is removed
 
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 # ContextKernel imports
-from contextkernel.utils.config import AppSettings #, get_settings # get_settings will be used in main.py to load and attach
-from contextkernel.utils.state_manager import AbstractStateManager # Assuming this is the abstract base class
-# Placeholder for ContextAgent - this would typically be imported from core_logic
-# from contextkernel.core_logic.context_agent import ContextAgent
+from contextkernel.utils.config import AppSettings
+from contextkernel.utils.state_manager import AbstractStateManager
+# Import the actual ContextAgent for type hinting and dependency injection
+from contextkernel.core_logic.llm_listener import ContextAgent # Renamed from LLMListener
 from contextkernel.core_logic.exceptions import (
     ConfigurationError,
     MemoryAccessError,
     CoreLogicError,
     ExternalServiceError,
-    # ApplicationError # A generic base for CK errors if defined
 )
 
-
-# Configure basic logging - This might be superseded by setup_logging in main.py
-# logging.basicConfig(level=logging.INFO) # Commented out to allow main.py to control logging config
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
     title="ContextKernel API",
     description="API for interacting with the ContextKernel system.",
-    version="0.1.0", # This could be sourced from AppSettings later
+    version="0.1.0",
 )
 
 # --- Placeholder for ContextAgent (until actual class is available) ---
-class ContextAgent(ABC):
-    @abstractmethod
-    async def handle_chat(
-        self,
-        chat_message: 'ChatMessage',
-        session_id: Optional[str], # Or pass state_manager if session handling is internal
-        state_manager: AbstractStateManager
-    ) -> 'ContextResponse': # Exact return type might vary
-        pass
-
-    @abstractmethod
-    async def ingest_data(self, data: 'IngestData', settings: AppSettings) -> 'IngestResponse':
-        pass
-
-    @abstractmethod
-    async def get_context_details(self, context_id: str, state_manager: AbstractStateManager) -> Optional['ContextResponse']:
-        pass
+# This placeholder is REMOVED. We use the actual ContextAgent for type hints where needed.
+# The methods like handle_chat and get_context_details are specific to the old design
+# and are not part of the new ContextAgent's primary interface for the loops.
+# The /ingest endpoint will use the new ContextAgent's ingest_data method.
+# The /context/{context_id} endpoint's ContextAgent dependency will need future refactoring.
 
 
 # --- Pydantic Models (Request/Response Schemas) ---
+# These (ChatMessage, ContextResponse, IngestData, IngestResponse) are defined in this file
+# and remain as they are used by the endpoints.
 class ChatMessage(BaseModel):
     user_id: str = Field(..., example="user123", description="Unique identifier for the user.")
     session_id: Optional[str] = Field(None, example="session456", description="Optional session identifier for context continuity.")
@@ -95,11 +82,21 @@ async def get_state_manager(request: Request) -> AbstractStateManager:
         raise ConfigurationError("StateManager is not available.")
     return request.app.state.state_manager
 
-async def get_context_agent(request: Request) -> ContextAgent:
-    if not hasattr(request.app.state, 'context_agent') or request.app.state.context_agent is None:
-        logger.error("ContextAgent not initialized or not found in app.state.")
-        raise ConfigurationError("ContextAgent is not available.")
-    return request.app.state.context_agent
+async def get_ingest_context_agent(request: Request) -> ContextAgent: # New specific provider
+    # This agent is configured with Chunker, HallucinationDetector, MemoryManager
+    if not hasattr(request.app.state, 'context_agent_for_ingest') or request.app.state.context_agent_for_ingest is None:
+        logger.error("ContextAgent (for ingest) not initialized or not found in app.state.context_agent_for_ingest.")
+        raise ConfigurationError("ContextAgent (for ingest) is not available.")
+    return request.app.state.context_agent_for_ingest
+
+async def get_legacy_context_agent(request: Request) -> Any: # Kept for /context/{context_id}, may be removed later
+    # This refers to an older/different type of agent if /context endpoint is maintained with old logic
+    if not hasattr(request.app.state, 'legacy_context_agent') or request.app.state.legacy_context_agent is None:
+        logger.warning("Legacy_context_agent not initialized or not found in app.state. /context endpoint may not function as expected.")
+        # Depending on strictness, could raise ConfigurationError or allow endpoint to handle missing agent
+        raise ConfigurationError("Legacy ContextAgent is not available for /context endpoint.")
+    return request.app.state.legacy_context_agent
+
 
 async def get_settings_dependency(request: Request) -> AppSettings:
     if not hasattr(request.app.state, 'settings') or request.app.state.settings is None:
@@ -238,7 +235,7 @@ async def chat_endpoint(
 @app.post("/ingest", response_model=IngestResponse, status_code=202, tags=["Data Ingestion"])
 async def ingest_endpoint(
     data: IngestData,
-    agent: ContextAgent = Depends(get_context_agent),
+    agent: ContextAgent = Depends(get_ingest_context_agent), # Updated dependency
     settings: AppSettings = Depends(get_settings_dependency)
 ):
     """
@@ -262,7 +259,7 @@ async def ingest_endpoint(
 @app.get("/context/{context_id}", response_model=ContextResponse, tags=["Context Retrieval"])
 async def get_context_endpoint(
     context_id: str,
-    agent: ContextAgent = Depends(get_context_agent), # Or state_manager if context is simple state
+    agent: Any = Depends(get_legacy_context_agent), # Updated dependency to legacy
     state_manager: AbstractStateManager = Depends(get_state_manager)
 ):
     """
