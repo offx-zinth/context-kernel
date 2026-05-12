@@ -1,110 +1,88 @@
+Here is the re-architected README. I have completely overhauled the system to pivot from a multi-agent, high-token architecture to a **Zero-Overhead Proactive Graph RAG** system. 
+
+I incorporated your "dual-output" idea (which is brilliant for cost-saving) and added a few advanced concepts: **Local NLP Pre-computation** (to avoid LLM calls for keyword extraction) and a **Biological "Sleep Cycle"** for background graph consolidation.
+
+***
+
 # ContextKernel 🧠
 
-**Give your AI a real brain. ContextKernel is a proactive, semantic memory layer for LLM-based agents, designed to overcome the limitations of simple RAG and enable true long-term reasoning.**
+**Zero-Overhead Proactive Graph RAG for LLM Agents.**
 
-[![Version](https://img.shields.io/badge/version-2.4-blue.svg)](https://github.com/your-repo/contextkernel)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+ContextKernel gives your AI a real, self-organizing brain. Designed to overcome the limitations of flat vector RAG, ContextKernel builds an associative knowledge graph on the fly—**without the crippling API costs of multi-agent orchestration.** 
+
+[![Version](https://img.shields.io/badge/version-3.0-blue.svg)](https://github.com/your-repo/contextkernel)
+[![Architecture: Single-Pass](https://img.shields.io/badge/Architecture-Single--Pass-success.svg)](#)
 
 ---
 
-## The Problem: LLMs Have Amnesia
+## 🛑 The Problem: Amnesia & Agentic Bloat
 
-Modern Large Language Models (LLMs) are incredibly powerful, but they have a fundamental flaw: they operate with the memory of a goldfish. Every interaction starts from a blank slate.
+1. **Flat RAG is Blind:** Vector databases just match semantic similarity. They don't understand *relationships* (e.g., "This error log is linked to User X, who was mentioned in this Slack thread").
+2. **Current Memory Agents are Too Expensive:** To fix flat RAG, frameworks use "Memory Agents" (Router LLMs, Summarizer LLMs, Retriever LLMs). Answering one user query suddenly costs 4 to 5 LLM calls. This introduces **high latency and massive API costs**.
 
-Retrieval-Augmented Generation (RAG) was a good first step, but it's a reactive band-aid, not a cure. It suffers from:
+## 💡 The Solution: Dual-Channel Output & Fast Graph RAG
 
-- **Context Blindness**: It dumps raw chunks of text into the prompt, often including irrelevant noise.
-- **Inefficiency**: It wastes precious tokens and money by loading more context than necessary.
-- **No Long-Term Learning**: It can't remember patterns, relationships, or context from previous sessions.
+ContextKernel v3.0 introduces a **Single-Pass Architecture**. We eliminated the orchestrator LLMs. 
 
-## The Solution: A Proactive Memory System
+Instead, we use fast, local NLP to traverse a Graph Database, inject the exact semantic neighborhood into the prompt, and force the main LLM to do double-duty: **respond to the user AND output an internal JSON payload to update its own memory graph.** One API call. Zero overhead.
 
-ContextKernel (CK) isn't just another vector database wrapper. It's a complete memory architecture that mimics a biological brain, with distinct layers for short-term, long-term, and raw sensory memory.
-
-It works proactively, anticipating what context an agent needs and retrieving it with surgical precision. It also learns continuously, optimizing and storing new information to become smarter over time.
-
-## Architecture Diagram (v2.4)
+## 📐 Architecture Diagram (v3.0)
 
 ```mermaid
 flowchart TD
-    subgraph Inputs
-        USER["User Input<br/>(Chat, Commands)"]
-        ENV["Environment Input<br/>(System Logs, APIs)"]
+    subgraph Input Phase ["1. Zero-Cost Extraction & Retrieval"]
+        U["User Input"] --> NLP["Fast Local NLP<br/>(GLiNER / KeyBERT)"]
+        NLP -->|Extract Entities & Intents| GraphDB[("Knowledge Graph<br/>(Neo4j/NetworkX)")]
+        GraphDB -->|N-Hop Traversal| ContextCompiler["Context Compiler"]
+        VDB[("Vector DB<br/>(Semantic Fallback)")] --> ContextCompiler
     end
 
-    subgraph CoreLogic ["Orchestration & Reasoning Layer"]
-        CA["Context Agent<br/>(Proactive Orchestrator)"]
-        Retriever["LLM-1: Retriever<br/>(Searches & Reads Memory)"]
-        Listener["LLM-2: Listener<br/>(Summarizes, Saves & Updates Memory)"]
+    subgraph Generation Phase ["2. The Single-Pass LLM Call"]
+        ContextCompiler -->|Inject Graph Schema + Query| LLM(("Main LLM<br/>(GPT-4/Claude 3.5)"))
     end
 
-    subgraph MemorySystem ["Unified Memory System"]
-        GraphDB["Graph DB<br/>(Central Index: Keywords, Links, Embeddings)"]
-
-        subgraph STM ["STM - Short-Term Memory"]
-            S1[VDB-1]
-            S2[...]
-            Sn[VDB-n]
-        end
-
-        subgraph LTM ["LTM - Long-Term Memory"]
-            L1[VDB-1]
-            L2[...]
-            Ln[VDB-n]
-        end
-
-        subgraph RawCache ["Raw Logs - Immutable Archive"]
-            R1[Log 1]
-            R2[...]
-            Rn[Log n]
-        end
+    subgraph Output Phase ["3. Dual-Channel Routing"]
+        LLM --> Router{{"Stream Splitter"}}
+        Router -->|Visible Text| UserOut("User Response<br/>(Markdown/Chat)")
+        Router -->|Hidden JSON Block| AsyncUpdater["Async Graph Updater"]
     end
 
-    USER --> CA
-    ENV --> CA
-    CA -->|"1. Get relevant context"| Retriever
-    CA -->|"4. Context missing, save this"| Listener
-    Retriever -->|"2. Search Index"| GraphDB
-    GraphDB -.->|"3a. Pointers"| STM
-    GraphDB -.->|"3b. Pointers"| LTM
-    GraphDB -.->|"3c. Pointers"| RawCache
-    Retriever -->|"3d. Read selective data"| STM
-    Retriever -->|"3d. Read selective data"| LTM
-    Retriever -->|"3d. Read selective data"| RawCache
-    Listener -->|"5. Save, Optimize & Update"| STM
-    Listener -->|"5. Save, Optimize & Update"| LTM
-    Listener -->|"5. Save, Optimize & Update"| RawCache
-    Listener -->|"5. Save, Optimize & Update"| GraphDB
+    subgraph Memory Management ["4. Background Consolidation"]
+        AsyncUpdater -->|Create Nodes/Edges| GraphDB
+        AsyncUpdater -->|Store Embeddings| VDB
+        SleepCycle["🌙 Sleep Cycle<br/>(Cron Job)"] -.->|Prunes, Merges, Optimizes| GraphDB
+    end
 ```
 
 ## 🚀 Key Features
 
-- ✅ **Proactive Context**: Automatically detects and injects relevant memory, even when not explicitly asked.
-- 🧠 **Selective Recall**: Uses a Graph DB index to retrieve only the precise chunks of information needed, not entire documents.
-- 📚 **Multi-Tier Memory**: Combines Short-Term (STM), Long-Term (LTM), and Raw Log databases for a layered, human-like memory system.
-- 🕸️ **Unified Graph Spine**: All memory is interlinked and discoverable through a central knowledge graph, enabling complex, multi-hop reasoning.
-- 🔄 **Continuous Learning**: An LLM-based "Listener" constantly processes new information, summarizes it, and integrates it into the memory system.
-- 💰 **Token Optimization**: Dramatically reduces prompt sizes and API costs by eliminating irrelevant context.
+*   ⚡ **Single-Pass Piggybacking:** The LLM answers the user in plain text, but appends a `<context_kernel>` JSON block at the end of its generation. We parse the text to the user and use the JSON to instantly update the graph. **1 Query = 1 LLM Call.**
+*   🕸️ **Proactive Graph Traversal:** Uses lightweight local models (like `GLiNER`) to extract entities from the user prompt *before* hitting the LLM. It grabs those entities, traverses the Knowledge Graph, and injects the precise relationships into the context.
+*   🧠 **Biological "Sleep Cycle":** Memory optimization shouldn't happen while the user is waiting. CK features a background worker that wakes up during low-traffic periods to merge duplicate graph nodes, summarize old STM (Short-Term Memory) into LTM (Long-Term Memory), and prune dead links using cheap local models.
+*   🔮 **Speculative Pre-fetching:** Because memory is structured as a graph, if a user queries "Node A", CK proactively pre-loads connected "Node B" and "Node C" into ultra-fast RAM (Redis) anticipating the next question.
 
-## How It Works
+## ⚙️ How It Works: The "Piggyback" Prompt
 
-ContextKernel operates on a sophisticated dual-loop system for reading and writing memory.
+We achieve zero-overhead by using advanced system prompting. The AI is instructed to structure its output like this:
 
-### 1. The Retrieval Flow (Reading Memory)
+**User Query:** *"Why did the staging deployment fail last week?"*
 
-1. The Context Agent receives a task (e.g., a user query).
-2. It dispatches the Retriever (LLM-1) to find context.
-3. The Retriever queries the Graph DB first, asking "What information is related to this task?"
-4. The Graph DB returns pointers to specific data chunks located in STM, LTM, or Raw Logs.
-5. The Retriever performs a selective read, pulling only the specified chunks into the final context.
+**LLM Response Stream:**
+```markdown
+The staging deployment failed because of a recurring database connection timeout associated with the `us-east-1` cluster migration.
 
-### 2. The Persistence Flow (Writing Memory)
-
-1. The Context Agent identifies a "context gap"—new, valuable information that isn't in memory.
-2. It dispatches the Listener (LLM-2) to process and save this information.
-3. The Listener summarizes, compresses, and structures the new data.
-4. It writes the data to the appropriate memory layer (e.g., a quick summary to STM, the raw data to the Raw Cache).
-5. Crucially, it updates the Graph DB with new nodes and links, making the new memory discoverable for future queries.
+<context_kernel>
+{
+  "graph_updates": [
+    {"entity": "staging_deployment", "relation": "FAILED_DUE_TO", "target": "db_timeout"},
+    {"entity": "db_timeout", "relation": "OCCURRED_IN", "target": "us-east-1_migration"}
+  ],
+  "stm_cache_update": "User inquired about staging failure; confirmed linked to us-east-1 migration.",
+  "confidence_score": 0.95
+}
+</context_kernel>
+```
+*ContextKernel intercepts the stream. The user only ever sees the markdown text. The JSON block is silently routed to the Graph Engine.*
 
 ## 📦 Installation
 
@@ -113,82 +91,78 @@ ContextKernel operates on a sophisticated dual-loop system for reading and writi
 git clone https://github.com/your-repo/contextkernel.git
 cd contextkernel
 
-# Install dependencies:
+# Install dependencies (includes fast local NLP packages):
 pip install -r requirements.txt
+python -m spacy download en_core_web_sm
 
-# Install the package in editable mode:
+# Install the package:
 pip install -e .
 ```
-Note: The PyPI installation (`pip install contextkernel`) will be available for future stable releases.
 
 ## ⚡ Quick Start
 
-Using ContextKernel is designed to be simple, hiding the architectural complexity behind a clean interface.
+ContextKernel wraps your existing LLM client. It handles the prompt-injection and output-parsing automatically.
 
 ```python
 import contextkernel as ck
+from openai import OpenAI
 
-# Initialize the kernel. This loads your configuration
-# and connects to the underlying memory databases.
-kernel = ck.Kernel()
+# Initialize the kernel with your underlying Graph/Vector stores
+kernel = ck.Kernel(
+    graph_uri="bolt://localhost:7687",
+    vector_store="chromadb"
+)
 
-# You don't need to manually fetch context. Just interact with the kernel.
-# It will proactively find and inject relevant memory from past interactions,
-# system logs, and documents.
-prompt = "Why did our staging deployment fail last week? Was it the same database connection issue we saw in May?"
+# Initialize standard OpenAI client
+client = OpenAI(api_key="your-api-key")
 
-response = kernel.chat(prompt)
+# Wrap your chat completion call
+prompt = "Was the staging failure related to the issue we had in May?"
 
-print(response)
-# The response is generated with deep context, aware of both last week's
-# staging logs and the incident report from May, without you having to
-# manually load any documents.
+# The kernel automatically handles local entity extraction, graph retrieval, 
+# and the dual-channel parsing. 
+response = kernel.chat(
+    llm_client=client,
+    model="gpt-4o",
+    messages=[{"role": "user", "content": prompt}]
+)
+
+print(response.text) 
+# "Yes, the May incident was also a db_timeout on the us-east-1 cluster..."
+
+print(response.internal_updates)
+# [{'entity': 'staging_failure', 'relation': 'SIMILAR_TO', 'target': 'may_incident'}]
 ```
 
 ## 🏗️ Project Structure
 
-The ContextKernel project is organized as follows:
+- **`contextkernel/`**
+  - **`nlp_extractor/`**: Zero-shot local NER models (GLiNER/spaCy) for fast entity extraction without LLM calls.
+  - **`graph_engine/`**: Manages the multi-hop traversal and Neo4j/NetworkX interactions.
+  - **`dual_channel/`**: The streaming parser that splits conversational text from internal JSON graph updates.
+  - **`sleep_cycle/`**: Background worker scripts for graph consolidation, summarization, and memory decay.
+  - **`prompts/`**: Highly optimized system prompts that enforce the dual-output constraint.
 
-- **`contextkernel/`**: The main package directory.
-  - **`core_logic/`**: Contains the core reasoning and orchestration modules like the Context Agent, LLM Retriever, LLM Listener, and Summarizer.
-  - **`memory_system/`**: Houses the components for the multi-tier memory, including interfaces for Graph DB, Short-Term Memory (STM), Long-Term Memory (LTM), Raw Cache, and the Graph Indexer.
-  - **`interfaces/`**: Provides API endpoints and the Python SDK for interacting with the kernel.
-  - **`utils/`**: Includes utility functions, configuration management, and helper scripts.
-  - **`tests/`**: Contains unit and integration tests for the various components of the kernel.
-- **`readme.md`**: This file.
-- **`requirements.txt`**: Project dependencies.
-- **`setup.py`**: Package installation script.
-- **`.gitignore`**: Specifies intentionally untracked files that Git should ignore.
+## ContextKernel v3 vs. Legacy Memory Agents
 
-## ContextKernel vs. Simple RAG
-
-| Feature | Simple RAG | ContextKernel |
-|---------|------------|---------------|
-| Strategy | Reactive (Fetch on demand) | Proactive (Anticipates need) |
-| Retrieval | Keyword/Vector search | Graph-indexed semantic search |
-| Context | Dumps raw chunks | Injects precise, relevant data |
-| Memory | Single, flat vector store | Multi-tier (STM, LTM, Raw) |
-| Learning | Static | Continuous & self-optimizing |
-| Efficiency | Low (High token waste) | High (Minimal token use) |
-| Use Case | Simple Q&A | Complex, multi-session reasoning |
+| Feature | Legacy RAG Agents (LangChain, etc.) | ContextKernel v3.0 |
+|---------|-------------------------------------|--------------------|
+| **LLM Calls per Turn** | 3 to 5 (Route, Retrieve, Answer, Save) | **Exactly 1** (Piggyback payload) |
+| **Retrieval Strategy** | High-latency LLM tool-calling | Local NLP + N-Hop Graph Traversal |
+| **Relationship Mapping**| Poor (Flat Vectors) | Excellent (Knowledge Graph) |
+| **Memory Update** | Blocking & synchronous | Async via dual-channel JSON |
+| **Optimization** | Reactive on query | Background "Sleep Cycle" |
 
 ## 🗺️ Roadmap
 
-- [ ] **More Database Adapters**: Support for additional Vector and Graph DBs.
-- [ ] **Observability Suite**: A UI to visualize the context being retrieved and the memory graph.
-- [ ] **Enterprise Security**: Enhanced roles, permissions, and data encryption.
-- [ ] **On-Premise Deployment**: Packaged solutions for running CK in private clouds.
+- [ ] **Dynamic Subgraph Injection**: Pass visual graph representations (via Mermaid or JSON) back to the LLM so it can "see" the exact shape of the memory.
+- [ ] **Cross-User Memory Namespaces**: Allow the graph to securely segment memories between different users while sharing global non-sensitive facts.
+- [ ] **Local LLM Integration**: First-class support for Ollama and vLLM for fully air-gapped proactive memory.
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please open an issue or submit a pull request.
+We are looking for contributors to help optimize the local NLP entity extraction pipelines and build adapters for more Graph Databases! Please open an issue or submit a PR.
 
 ## 📄 License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
-
-
-----
-
-
-re arcitect this into a a proactive graph rag and also optimize like no/very low llm calls use the env's ai itself like ask it to give responce in a way one for user another for us in json formet and add some of ur ideas like this feel free to remove this idea also
+MIT License. See the LICENSE file for details.
